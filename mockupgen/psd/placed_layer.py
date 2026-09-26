@@ -53,14 +53,38 @@ class PlacedTransform:
     def has_mesh_warp(self) -> bool:
         return bool(self.mesh_points) and len(self.mesh_points) == 16
 
-    def mesh_is_local(self, canvas_size: tuple[int, int] | None = None) -> bool:
-        """True if mesh points look like local SO coordinates (near origin)."""
+    def mesh_is_local(
+        self,
+        canvas_size: tuple[int, int] | None = None,
+        local_size: tuple[float, float] | None = None,
+    ) -> bool:
+        """True if mesh points look like local SO coordinates (near origin / inside SO size)."""
         if not self.mesh_points:
             return False
         xs = [p[0] for p in self.mesh_points]
         ys = [p[1] for p in self.mesh_points]
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
+        span_x = max_x - min_x
+        span_y = max_y - min_y
+
+        # Strongest signal: mesh lives inside the smart-object native size
+        if local_size is not None:
+            lw, lh = float(local_size[0]), float(local_size[1])
+            if lw > 0 and lh > 0:
+                if (
+                    min_x >= -80
+                    and min_y >= -80
+                    and max_x <= lw + 80
+                    and max_y <= lh + 80
+                ):
+                    return True
+                # Mesh is clearly smaller than the document canvas
+                if canvas_size:
+                    cw, ch = canvas_size
+                    if span_x < cw * 0.55 and span_y < ch * 0.55 and min_x > -100 and min_y > -100:
+                        return True
+
         cx = sum(c[0] for c in self.corners) / 4
         cy = sum(c[1] for c in self.corners) / 4
         mesh_cx = (min_x + max_x) / 2
@@ -88,7 +112,7 @@ class PlacedTransform:
         if not self.mesh_points or len(self.mesh_points) != 16:
             return self.mesh_points
 
-        if not self.mesh_is_local(canvas_size):
+        if not self.mesh_is_local(canvas_size, local_size=local_size):
             return self.mesh_points
 
         if self.mesh_bounds:
@@ -161,7 +185,7 @@ def _parse_mesh_bounds(data: bytes, start: int) -> Optional[tuple[float, float, 
         if bottom > top or right > left:
             return (left, top, right, bottom)
     except Exception as exc:
-        log.debug("bounds parse failed: %s", exp)
+        log.debug("bounds parse failed: %s", exc)
     return None
 
 
@@ -204,7 +228,7 @@ def _parse_mesh_points(data: bytes, start: int) -> Optional[list[tuple[float, fl
             return None
         return list(zip(xs, ys))
     except Exception as exc:
-        log.debug("mesh parse failed: %s", exc)
+        log.debug("mesh parse failed: %s", exp)
         return None
 
 

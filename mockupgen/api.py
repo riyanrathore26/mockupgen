@@ -92,20 +92,31 @@ class Mockup:
             log.info("Wrote extracted file to %s", dest)
         return data
 
-    def replace_smart_object(self, name: str, image_path: str | Path) -> None:
+    def replace_smart_object(
+        self,
+        name: str,
+        image_path: str | Path,
+        *,
+        fill: float = 1.0,
+        top_bias: float = 0.5,
+    ) -> None:
         """Replace smart-object content with the given image (PNG embed).
 
         The design is fitted onto the native smart-object canvas size (from the
         embedded PSB/PNG) so export warps match Photopea/Photoshop placement.
+
+        fill=1.0 → actual size (fills the SO canvas, aspect preserved).
+        Lower values (e.g. 0.7) shrink the design inside the canvas.
         """
         import tempfile
 
         layer, linked_file = self._resolve(name)
         log.info(
-            "replace_smart_object(%r) uuid=%s current_file=%r",
+            "replace_smart_object(%r) uuid=%s current_file=%r fill=%.2f",
             name,
             linked_file.uuid,
             linked_file.filename,
+            fill,
         )
         image_path = Path(image_path)
 
@@ -113,11 +124,13 @@ class Mockup:
         dims = so_mod.linked_file_dimensions(linked_file)
         if dims and dims[0] > 0 and dims[1] > 0:
             sow, soh = dims
-            prepared = so_mod.prepare_design_on_canvas(image_path, sow, soh)
+            prepared = so_mod.prepare_design_on_canvas(
+                image_path, sow, soh, fill=fill, top_bias=top_bias
+            )
             tmp = Path(tempfile.mkdtemp(prefix="mockupgen_")) / f"{name}_prepared.png"
             prepared.save(tmp, "PNG")
             embed_path = tmp
-            log.info("Using native SO canvas %dx%d for %r", sow, soh, name)
+            log.info("Using native SO canvas %dx%d for %r (fill=%.2f)", sow, soh, name, fill)
         else:
             embed_path = image_path
             log.warning(

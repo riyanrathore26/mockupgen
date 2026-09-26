@@ -103,13 +103,14 @@ def prepare_design_on_canvas(
     canvas_w: int,
     canvas_h: int,
     *,
-    fill: float = 0.7,
-    top_bias: float = 0.2,
+    fill: float = 1.0,
+    top_bias: float = 0.5,
 ) -> "object":
     """Place design on a transparent canvas matching the smart-object size.
 
-    Fits the design into a portion of the SO canvas (default 70%) so side-angle
-    mockups match Photopea placement. Keeps aspect ratio and transparency.
+    Fits the design into the SO canvas at the given fill ratio (default 1.0 =
+    actual size, full canvas). Keeps aspect ratio and transparency. top_bias
+    0.5 = vertically centered.
     """
     from PIL import Image
 
