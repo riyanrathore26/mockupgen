@@ -16,11 +16,11 @@ log = get_logger("placed_layer")
 class PlacedTransform:
     """Placement of a smart object on the parent canvas.
 
-    ``corners`` are (x, y) in document pixel space, order:
-    top-left, top-right, bottom-right, bottom-left.
+    ``corners`` are (x, y) in document pixel space: TL, TR, BR, BL.
 
-    ``mesh_points`` is the 4×4 custom-envelope-warp control grid
-    (16 points, row-major, document space) when present.
+    ``mesh_points`` is the 4x4 custom-envelope-warp control grid (16 points,
+    row-major). Coordinates may be in document space or local (smart-object
+    native) space — use :meth:`document_mesh` to normalise.
     """
 
     uuid: str
@@ -35,10 +35,11 @@ class PlacedTransform:
         tuple[float, float],
     ]
     mesh_points: Optional[list[tuple[float, float]]] = None
+    mesh_bounds: Optional[tuple[float, float, float, float]] = None
 
     @property
     def bbox(self) -> tuple[int, int, int, int]:
-        pts = self.mesh_points if self.mesh_points else self.corners
+        pts = self.document_mesh() or list(self.corners)
         xs = [c[0] for c in pts]
         ys = [c[1] for c in pts]
         return (
@@ -52,15 +53,125 @@ class PlacedTransform:
     def has_mesh_warp(self) -> bool:
         return bool(self.mesh_points) and len(self.mesh_points) == 16
 
+    def mesh_is_local(self, canvas_size: tuple[int, int] | None = None) -> bool:
+        """True if mesh points look like local SO coordinates (near origin)."""
+        if not self.mesh_points:
+            return False
+        xs = [p[0] for p in self.mesh_points]
+        ys = [p[1] for p in self.mesh_points]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        cx = sum(c[0] for c in self.corners) / 4
+        cy = sum(c[1] for c in self.corners) / 4
+        mesh_cx = (min_x + max_x) / 2
+        mesh_cy = (min_y + max_y) / 2
+        dist = ((mesh_cx - cx) ** 2 + (mesh_cy - cy) ** 2) ** 0.5
+        if dist > 80:
+            return True
+        if canvas_size:
+            cw, ch = canvas_size
+            if min_x > -80 and min_y > -80 and max_x < cw * 0.65 and max_y < ch * 0.65:
+                if abs(mesh_cx - cx) > 50 or abs(mesh_cy - cy) > 50:
+                    return True
+        return False
+
+    def document_mesh(
+        self,
+        canvas_size: tuple[int, int] | None = None,
+        local_size: tuple[float, float] | None = None,
+    ) -> Optional[list[tuple[float, float]]]:
+        """Return mesh points in document space.
+
+        If the stored mesh is local (SO-native), maps each point through the
+        bilinear map defined by ``corners``.
+        """
+        if not self.mesh_points or len(self.mesh_points) != 16:
+            return self.mesh_points
+
+        if not self.mesh_is_local(canvas_size):
+            return self.mesh_points
+
+        if self.mesh_bounds:
+            left, top, right, bottom = self.mesh_bounds
+            bw = right - left if right != left else 1.0
+            bh = bottom - top if bottom != top else 1.0
+        elif local_size:
+            left = top = 0.0
+            bw, bh = float(local_size[0]), float(local_size[1])
+        else:
+            xs = [p[0] for p in self.mesh_points]
+            ys = [p[1] for p in self.mesh_points]
+            left, top = min(xs), min(ys)
+            bw = max(xs) - left or 1.0
+            bh = max(ys) - top or 1.0
+
+        TL, TR, BR, BL = self.corners
+
+        def bilinear(u: float, v: float) -> tuple[float, float]:
+            top_x = TL[0] * (1 - u) + TR[0] * u
+            top_y = TL[1] * (1 - u) + TR[1] * u
+            bot_x = BL[0] * (1 - u) + BR[0] * u
+            bot_y = BL[1] * (1 - u) + BR[1] * u
+            return (top_x * (1 - v) + bot_x * v, top_y * (1 - v) + bot_y * v)
+
+        doc: list[tuple[float, float]] = []
+        for lx, ly in self.mesh_points:
+            u = (lx - left) / bw
+            v = (ly - top) / bh
+            doc.append(bilinear(u, v))
+
+        log.debug(
+            "Mapped local mesh -> document (bounds %.0fx%.0f, corner TL~%s)",
+            bw,
+            bh,
+            (round(doc[0][0]), round(doc[0][1])),
+        )
+        return doc
+
+
+def _parse_mesh_bounds(data: bytes, start: int) -> Optional[tuple[float, float, float, float]]:
+    idx = data.find(b"classFloatRect", start)
+    if idx < 0:
+        return None
+    try:
+        pos = idx + len(b"classFloatRect")
+        count = struct.unpack(">I", data[pos : pos + 4])[0]
+        pos += 4
+        vals: dict[str, float] = {}
+        for _ in range(count):
+            klen = struct.unpack(">I", data[pos : pos + 4])[0]
+            pos += 4
+            if klen == 0:
+                key = data[pos : pos + 4].decode("ascii", errors="replace")
+                pos += 4
+            else:
+                key = data[pos : pos + klen].decode("ascii", errors="replace")
+                pos += klen
+            typ = data[pos : pos + 4]
+            pos += 4
+            if typ != b"doub":
+                break
+            val = struct.unpack(">d", data[pos : pos + 8])[0]
+            pos += 8
+            vals[key.strip()] = val
+        top = vals.get("Top") or vals.get("Top ") or 0.0
+        left = vals.get("Left") or vals.get("Left ") or 0.0
+        bottom = vals.get("Btom") or vals.get("Bottom") or 0.0
+        right = vals.get("Rght") or vals.get("Right") or 0.0
+        if bottom > top or right > left:
+            return (left, top, right, bottom)
+    except Exception as exc:
+        log.debug("bounds parse failed: %s", exp)
+    return None
+
 
 def _parse_mesh_points(data: bytes, start: int) -> Optional[list[tuple[float, float]]]:
-    """Parse customEnvelopeWarp meshPoints ObAr from PlLd warp descriptor."""
     idx = data.find(b"ObAr", start)
     if idx < 0 or idx + 20 > len(data):
         return None
     pos = idx + 4
     try:
-        pos += 4  # version (16)
+        pos += 4
         ulen = struct.unpack(">I", data[pos : pos + 4])[0]
         pos += 4 + ulen * 2
         cid_len = struct.unpack(">I", data[pos : pos + 4])[0]
@@ -81,7 +192,7 @@ def _parse_mesh_points(data: bytes, start: int) -> Optional[list[tuple[float, fl
             else:
                 key = data[pos : pos + klen].decode("ascii", errors="replace")
                 pos += klen
-            pos += 8  # UnFl + #Pxl
+            pos += 8
             count = struct.unpack(">I", data[pos : pos + 4])[0]
             pos += 4
             vals = list(struct.unpack(f">{count}d", data[pos : pos + 8 * count]))
@@ -98,7 +209,6 @@ def _parse_mesh_points(data: bytes, start: int) -> Optional[list[tuple[float, fl
 
 
 def parse_placed_layer(data: bytes) -> Optional[PlacedTransform]:
-    """Parse a PlLd / plLd tagged-block payload."""
     if len(data) < 8 + 16 + 64:
         return None
     if data[0:4] not in (b"plcL", b"plLd"):
@@ -129,14 +239,16 @@ def parse_placed_layer(data: bytes) -> Optional[PlacedTransform]:
     )
     pos += 64
 
+    bounds = _parse_mesh_bounds(data, pos)
     mesh = _parse_mesh_points(data, pos)
 
     log.debug(
-        "PlLd uuid=%s type=%d corners=%s mesh=%s",
+        "PlLd uuid=%s type=%d corners=%s mesh=%s bounds=%s",
         uuid,
         ptype,
         [(round(x, 1), round(y, 1)) for x, y in corners],
         f"{len(mesh)} pts" if mesh else "none",
+        bounds,
     )
     return PlacedTransform(
         uuid=uuid,
@@ -146,6 +258,7 @@ def parse_placed_layer(data: bytes) -> Optional[PlacedTransform]:
         layer_type=ptype,
         corners=corners,
         mesh_points=mesh,
+        mesh_bounds=bounds,
     )
 
 
