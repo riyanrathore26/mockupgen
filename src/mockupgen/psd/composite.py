@@ -1,22 +1,20 @@
-"""Phase 5 — composite / export (warps + shading + blend).
+"""Phase 5 — composite / export (perspective warp + optional soft fabric detail).
 
-Strategy (v2):
-1. Decode the document's flattened Image Data as the base canvas.
-2. For each replaced smart-object layer:
-   a. Perspective-warp the design onto PlLd 4 corners.
-   b. Build a silhouette mask from the original composite in that
-      region (so the design follows the shirt hem / non-rect shape).
-   c. Extract fabric shading (luminance) from the original region and
-      multiply it onto the new design (wrinkles / lighting).
-   d. Alpha-composite onto a cleaned base.
-3. Full bezier mesh warp + advanced blend modes remain future work.
+Strategy (v3 — clean):
+1. Decode the flattened Image Data as the base canvas.
+2. Perspective-warp each replacement design onto its PlLd 4 corners.
+3. Optionally multiply a *subtle* high-pass fabric detail from the
+   original composite (strength ~0.25) so folds appear without blow-outs.
+4. Alpha-composite the warped design on top of the base (opaque design
+   fully covers the old artwork in that region).
+
+No harsh luminance remapping — that caused the white streak artifacts.
 """
 
 from __future__ import annotations
 
 import io
 import struct
-from pathlib import Path
 from typing import Optional
 
 from PIL import Image, ImageChops, ImageFilter
@@ -28,9 +26,12 @@ from mockupgen.psd.placed_layer import get_placed_transform
 
 log = get_logger("composite")
 
+# How strongly to apply fabric-fold detail (0 = flat clean, 1 = full).
+# Keep low to avoid white blow-outs.
+FABRIC_STRENGTH = 0.25
+
 
 def decode_image_data(doc: PSDDocument) -> Image.Image:
-    """Decode Section 5 (flattened composite) into a PIL RGB/RGBA image."""
     header = doc.header
     w, h = header.width, header.height
     ch = header.channels
@@ -117,7 +118,6 @@ def warp_to_quad(
     ],
     canvas_size: tuple[int, int],
 ) -> Image.Image:
-    """Perspective-warp ``src`` onto ``corners`` of a transparent canvas."""
     w, h = src.size
     src_corners = [(0.0, 0.0), (float(w), 0.0), (float(w), float(h)), (0.0, float(h))]
     coeffs = _find_perspective_coeffs(list(corners), src_corners)
@@ -186,87 +186,47 @@ def _decode_embedded_psd_image(data: bytes) -> Image.Image:
     raise NotImplementedError(f"embedded channels {channels}")
 
 
-def _extract_region_shading_and_mask(
+def _fabric_detail_map(
     composite: Image.Image,
     corners: tuple,
     canvas_size: tuple[int, int],
-    white_threshold: int = 235,
-) -> tuple[Image.Image, Image.Image]:
-    """Return (shading_L, mask_L) for the design quad in the original composite."""
-    solid = Image.new("RGBA", (100, 100), (255, 255, 255, 255))
-    footprint = warp_to_quad(solid, corners, canvas_size)
-    fp_alpha = footprint.split()[3]
-
-    comp = composite.convert("RGB")
-    r, g, b = comp.split()
-    lum = ImageChops.add(
-        ImageChops.add(
-            r.point(lambda x: x * 77 // 256),
-            g.point(lambda x: x * 150 // 256),
-        ),
-        b.point(lambda x: x * 29 // 256),
-    )
-    inv_white = lum.point(lambda x: 255 if x < white_threshold else 0)
-    mask = ImageChops.multiply(inv_white, fp_alpha)
-    mask = mask.filter(ImageFilter.GaussianBlur(radius=0.8))
-
-    lum_px = lum.load()
-    mask_px = mask.load()
-    w, h = canvas_size
-    mask_hist = [0] * 256
-    total = 0
-    for y in range(h):
-        for x in range(w):
-            m = mask_px[x, y]
-            if m > 128:
-                mask_hist[lum_px[x, y]] += m
-                total += m
-    if total == 0:
-        return Image.new("L", canvas_size, 128), mask
-
-    cum = 0
-    median = 128
-    half = total // 2
-    for i, v in enumerate(mask_hist):
-        cum += v
-        if cum >= half:
-            median = max(i, 1)
-            break
-
-    scale = 128.0 / median
-    shading = lum.point(lambda x: max(0, min(255, int(x * scale))))
-    return shading, mask
-
-
-def _apply_shading_and_mask(
-    warped: Image.Image,
-    shading: Image.Image,
-    mask: Image.Image,
 ) -> Image.Image:
-    """Multiply warped RGB by shading and restrict alpha to mask."""
+    """Grayscale high-pass of the design region, centred on 128."""
+    solid = Image.new("RGBA", (64, 64), (255, 255, 255, 255))
+    footprint = warp_to_quad(solid, corners, canvas_size)
+    alpha = footprint.split()[3]
+
+    gray = composite.convert("L")
+    blur = gray.filter(ImageFilter.GaussianBlur(radius=12))
+    detail = ImageChops.subtract(gray, blur, scale=1.0, offset=128)
+
+    neutral = Image.new("L", canvas_size, 128)
+    return Image.composite(detail, neutral, alpha)
+
+
+def _apply_soft_fabric(
+    warped: Image.Image,
+    detail: Image.Image,
+    strength: float = FABRIC_STRENGTH,
+) -> Image.Image:
+    """Gently multiply fabric detail onto warped RGBA design."""
+    if strength <= 0:
+        return warped
+
     warped = warped.convert("RGBA")
     wr, wg, wb, wa = warped.split()
 
-    def mul_channel(ch: Image.Image, sh: Image.Image) -> Image.Image:
-        return ImageChops.multiply(ch, sh).point(lambda x: min(255, x * 2))
+    neutral = Image.new("L", detail.size, 128)
+    effective = Image.blend(neutral, detail, strength)
 
-    nr = mul_channel(wr, shading)
-    ng = mul_channel(wg, shading)
-    nb = mul_channel(wb, shading)
-    na = ImageChops.multiply(wa, mask)
-    return Image.merge("RGBA", (nr, ng, nb, na))
+    def soft_mul(ch: Image.Image, d: Image.Image) -> Image.Image:
+        m = ImageChops.multiply(ch, d)
+        return m.point(lambda x: min(255, int(x * 255 / 128)))
 
-
-def _clean_design_region(
-    composite: Image.Image,
-    mask: Image.Image,
-    shirt_sample: tuple[int, int, int] = (245, 245, 245),
-) -> Image.Image:
-    """Paint shirt colour over the old design so the new one can replace it."""
-    base = composite.convert("RGBA")
-    solid = Image.new("RGBA", base.size, (*shirt_sample, 255))
-    solid.putalpha(mask)
-    return Image.alpha_composite(base, solid)
+    nr = soft_mul(wr, effective)
+    ng = soft_mul(wg, effective)
+    nb = soft_mul(wb, effective)
+    return Image.merge("RGBA", (nr, ng, nb, wa))
 
 
 def composite_document(
@@ -274,12 +234,13 @@ def composite_document(
     *,
     overrides: Optional[dict[str, Image.Image]] = None,
     original_composite: Optional[Image.Image] = None,
+    fabric_strength: float = FABRIC_STRENGTH,
 ) -> Image.Image:
     """Build an exported RGB image of the document."""
     overrides = overrides or {}
     base_rgb = decode_image_data(doc)
     canvas_size = (doc.width, doc.height)
-    source_for_shading = original_composite if original_composite is not None else base_rgb
+    source = original_composite if original_composite is not None else base_rgb
 
     result = base_rgb.convert("RGBA")
 
@@ -297,19 +258,18 @@ def composite_document(
             continue
 
         log.info(
-            "Compositing smart object %r opacity=%d corners=%s",
+            "Compositing smart object %r opacity=%d corners=%s fabric=%.2f",
             name,
             layer.opacity,
             [(round(x, 1), round(y, 1)) for x, y in transform.corners],
+            fabric_strength,
         )
-
-        shading, mask = _extract_region_shading_and_mask(
-            source_for_shading, transform.corners, canvas_size
-        )
-        result = _clean_design_region(result, mask)
 
         warped = warp_to_quad(img, transform.corners, canvas_size)
-        warped = _apply_shading_and_mask(warped, shading, mask)
+
+        if fabric_strength > 0 and source is not None:
+            detail = _fabric_detail_map(source, transform.corners, canvas_size)
+            warped = _apply_soft_fabric(warped, detail, fabric_strength)
 
         if layer.opacity < 255:
             a = warped.split()[3].point(lambda p: p * layer.opacity // 255)
