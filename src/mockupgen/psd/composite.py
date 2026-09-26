@@ -137,7 +137,6 @@ def warp_to_mesh(
     canvas_size: tuple[int, int],
     grid: int = MESH_GRID,
 ) -> Image.Image:
-    """Warp src onto a 4x4 cubic bezier mesh via subdivided quads."""
     if src.mode != "RGBA":
         src = src.convert("RGBA")
     cw, ch = canvas_size
@@ -257,18 +256,45 @@ def _decode_embedded_psd_image(data: bytes) -> Image.Image:
     raise NotImplementedError(f"embedded channels {channels}")
 
 
+def _apply_fabric_shading(
+    warped: Image.Image,
+    shirt_source: Image.Image,
+    strength: float,
+) -> Image.Image:
+    """Multiply design by soft fabric fold map from the original composite."""
+    strength = max(0.0, min(1.0, strength))
+    if strength < 1e-6:
+        return warped
+
+    w, h = warped.size
+    gray = shirt_source.convert("L").resize((w, h), Image.Resampling.BILINEAR)
+    blur = gray.filter(ImageFilter.GaussianBlur(radius=18))
+    detail = ImageChops.subtract(gray, blur, scale=1.0, offset=128)
+
+    def map_factor(d: int) -> int:
+        f = 1.0 + strength * (d - 128) / 128.0
+        f = max(0.7, min(1.25, f))
+        return int(round(f * 128))
+
+    factor_l = detail.point(map_factor)
+    r, g, b, a = warped.split()
+    factor_rgb = Image.merge("RGB", (factor_l, factor_l, factor_l))
+    rgb = Image.merge("RGB", (r, g, b))
+    shaded = ImageChops.multiply(rgb, factor_rgb)
+    shaded = shaded.point(lambda px: min(255, int(px * 255 / 128)))
+    shaded = shaded.convert("RGBA")
+    shaded.putalpha(a)
+    return shaded
+
+
 def composite_document(
     doc: PSDDocument,
     *,
     overrides: Optional[dict[str, Image.Image]] = None,
     original_composite: Optional[Image.Image] = None,
-    fabric_strength: float = 0.0,
+    fabric_strength: float = 0.35,
 ) -> Image.Image:
-    """Build an exported RGB image of the document.
-
-    Uses bezier mesh warp when PlLd has customEnvelopeWarp mesh points.
-    Transparent design pixels leave the original composite visible (real shirt).
-    """
+    """Build an exported RGB image of the document."""
     overrides = overrides or {}
     base_rgb = decode_image_data(doc)
     canvas_size = (doc.width, doc.height)
@@ -299,11 +325,15 @@ def composite_document(
         )
 
         if transform.has_mesh_warp:
-            # Mesh may be in local SO space — normalise to document pixels
             mesh = transform.document_mesh(canvas_size)
             warped = warp_to_mesh(img, mesh, canvas_size)  # type: ignore
         else:
             warped = warp_to_quad(img, transform.corners, canvas_size)
+
+        if fabric_strength > 0 and original_composite is not None:
+            warped = _apply_fabric_shading(
+                warped, original_composite, fabric_strength
+            )
 
         if layer.opacity < 255:
             a = warped.split()[3].point(lambda p: p * layer.opacity // 255)
