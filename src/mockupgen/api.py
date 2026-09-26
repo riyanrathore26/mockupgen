@@ -132,18 +132,19 @@ class Mockup:
         self._dirty = False
 
     def export(self, path: str | Path) -> Path:
-        """Full composite export (warps + normal blend).
+        """Full composite export (warps + fabric shading + silhouette mask).
 
-        Decodes the flattened document composite, then perspective-warps
-        every replaced smart-object design onto its PlLd corners and
-        alpha-composites them. Writes a PNG (or JPEG if path ends with
-        .jpg/.jpeg) and returns the output path.
-
-        This is Phase 5 v1: normal blend mode and 4-corner perspective
-        only (no mesh warp, no advanced blend modes yet).
+        Decodes the original flattened composite for shading/mask, then
+        perspective-warps each replaced smart-object design onto its PlLd
+        corners, multiplies fabric lighting, and alpha-composites.
+        Writes PNG (or JPEG if path ends with .jpg/.jpeg).
         """
         from PIL import Image
-        from mockupgen.psd.composite import composite_document, linked_file_to_image
+        from mockupgen.psd.composite import (
+            composite_document,
+            linked_file_to_image,
+            decode_image_data,
+        )
         from mockupgen.psd.document import PSDDocument
 
         path = Path(path)
@@ -151,18 +152,18 @@ class Mockup:
 
         log.info("export() → %s", path)
 
+        # Original (pre-replace) composite for fabric shading / silhouette
+        original_composite = decode_image_data(self._doc)
+
         # Re-parse the (possibly modified) PSD bytes so layer UUIDs still match
         doc = PSDDocument.open(bytes(self._raw))
 
         overrides: dict[str, Image.Image] = {}
 
-        # Prefer in-memory replacement paths tracked by replace_smart_object
         for name, img_path in self._replacements.items():
             log.debug("Loading override for %r from %s", name, img_path)
             overrides[name] = Image.open(img_path).convert("RGBA")
 
-        # Also try linked files that are already raster (PNG/JPEG) so
-        # non-replaced smart objects can be re-composited if desired.
         if not overrides:
             linked = self._ensure_linked()
             for layer in doc.smart_objects():
@@ -178,7 +179,9 @@ class Mockup:
                 if img is not None:
                     overrides[layer.display_name] = img
 
-        result = composite_document(doc, overrides=overrides)
+        result = composite_document(
+            doc, overrides=overrides, original_composite=original_composite
+        )
 
         suffix = path.suffix.lower()
         if suffix in (".jpg", ".jpeg"):
