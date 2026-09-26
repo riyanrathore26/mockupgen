@@ -21,7 +21,6 @@ class Mockup:
         self._raw = bytearray(document._raw)
         self._linked: Optional[so_mod.LinkedFiles] = None
         self._dirty = False
-        # name -> path of last replacement image (for export without re-reading PSD)
         self._replacements: dict[str, Path] = {}
         log.debug("Mockup created: %s", self)
 
@@ -94,11 +93,7 @@ class Mockup:
         return data
 
     def replace_smart_object(self, name: str, image_path: str | Path) -> None:
-        """Replace smart-object content with the given image (PNG embed).
-
-        Large images are auto-resized so Photopea does not report the file
-        as damaged. Call :meth:`save` and/or :meth:`export` afterwards.
-        """
+        """Replace smart-object content with the given image (PNG embed)."""
         layer, linked_file = self._resolve(name)
         log.info(
             "replace_smart_object(%r) uuid=%s current_file=%r",
@@ -106,10 +101,8 @@ class Mockup:
             linked_file.uuid,
             linked_file.filename,
         )
-
         image_path = Path(image_path)
         new_data = so_mod.image_to_embed_bytes(image_path)
-
         new_raw = so_mod.replace_linked_file_data(
             raw_psd=bytes(self._raw),
             linked_files=self._ensure_linked(),
@@ -131,13 +124,14 @@ class Mockup:
         log.info("Saved successfully")
         self._dirty = False
 
-    def export(self, path: str | Path) -> Path:
-        """Full composite export (warps + fabric shading + silhouette mask).
+    def export(self, path: str | Path, *, fabric_strength: float | None = None) -> Path:
+        """Export composite PNG/JPEG.
 
-        Decodes the original flattened composite for shading/mask, then
-        perspective-warps each replaced smart-object design onto its PlLd
-        corners, multiplies fabric lighting, and alpha-composites.
-        Writes PNG (or JPEG if path ends with .jpg/.jpeg).
+        Args:
+            path: Output path (.png or .jpg).
+            fabric_strength: 0 = clean flat design (recommended default for
+                solid colors). ~0.25 = subtle fabric folds. Omit to use
+                package default (0.25).
         """
         from PIL import Image
         from mockupgen.psd.composite import (
@@ -149,17 +143,12 @@ class Mockup:
 
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-
         log.info("export() → %s", path)
 
-        # Original (pre-replace) composite for fabric shading / silhouette
         original_composite = decode_image_data(self._doc)
-
-        # Re-parse the (possibly modified) PSD bytes so layer UUIDs still match
         doc = PSDDocument.open(bytes(self._raw))
 
         overrides: dict[str, Image.Image] = {}
-
         for name, img_path in self._replacements.items():
             log.debug("Loading override for %r from %s", name, img_path)
             overrides[name] = Image.open(img_path).convert("RGBA")
@@ -168,9 +157,7 @@ class Mockup:
             linked = self._ensure_linked()
             for layer in doc.smart_objects():
                 uuid = layer.placed_layer_uuid()
-                lf = None
-                if uuid:
-                    lf = linked.find_by_uuid(uuid)
+                lf = linked.find_by_uuid(uuid) if uuid else None
                 if lf is None:
                     lf = linked.find_by_filename(layer.display_name)
                 if lf is None:
@@ -179,9 +166,10 @@ class Mockup:
                 if img is not None:
                     overrides[layer.display_name] = img
 
-        result = composite_document(
-            doc, overrides=overrides, original_composite=original_composite
-        )
+        kwargs = dict(overrides=overrides, original_composite=original_composite)
+        if fabric_strength is not None:
+            kwargs["fabric_strength"] = fabric_strength
+        result = composite_document(doc, **kwargs)
 
         suffix = path.suffix.lower()
         if suffix in (".jpg", ".jpeg"):
@@ -199,7 +187,6 @@ class Mockup:
         if self._linked is None:
             log.debug("Parsing linked files (lnk2) …")
             from mockupgen.psd.document import PSDDocument
-
             tmp = PSDDocument.open(bytes(self._raw))
             self._linked = so_mod.load_linked_files_from_document(tmp)
         return self._linked
