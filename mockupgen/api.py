@@ -93,7 +93,13 @@ class Mockup:
         return data
 
     def replace_smart_object(self, name: str, image_path: str | Path) -> None:
-        """Replace smart-object content with the given image (PNG embed)."""
+        """Replace smart-object content with the given image (PNG embed).
+
+        The design is fitted onto the native smart-object canvas size (from the
+        embedded PSB/PNG) so export warps match Photopea/Photoshop placement.
+        """
+        import tempfile
+
         layer, linked_file = self._resolve(name)
         log.info(
             "replace_smart_object(%r) uuid=%s current_file=%r",
@@ -102,7 +108,24 @@ class Mockup:
             linked_file.filename,
         )
         image_path = Path(image_path)
-        new_data = so_mod.image_to_embed_bytes(image_path)
+
+        # Fit design onto the smart object's native pixel canvas
+        dims = so_mod.linked_file_dimensions(linked_file)
+        if dims and dims[0] > 0 and dims[1] > 0:
+            sow, soh = dims
+            prepared = so_mod.prepare_design_on_canvas(image_path, sow, soh)
+            tmp = Path(tempfile.mkdtemp(prefix="mockupgen_")) / f"{name}_prepared.png"
+            prepared.save(tmp, "PNG")
+            embed_path = tmp
+            log.info("Using native SO canvas %dx%d for %r", sow, soh, name)
+        else:
+            embed_path = image_path
+            log.warning(
+                "Could not read native SO size for %r — embedding image as-is",
+                name,
+            )
+
+        new_data = so_mod.image_to_embed_bytes(embed_path)
         new_raw = so_mod.replace_linked_file_data(
             raw_psd=bytes(self._raw),
             linked_files=self._ensure_linked(),
@@ -112,7 +135,8 @@ class Mockup:
         self._raw = bytearray(new_raw)
         self._dirty = True
         self._linked = None
-        self._replacements[name] = image_path
+        # Export must use the prepared (SO-sized) image, not the raw texture
+        self._replacements[name] = embed_path
         log.info("Replacement done — call save() and/or export()")
 
     def save(self, path: str | Path) -> None:
