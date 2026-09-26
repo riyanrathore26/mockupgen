@@ -203,21 +203,6 @@ def warp_to_mesh(
     return out
 
 
-def _mesh_boundary_polygon(
-    mesh: list[tuple[float, float]], samples: int = 32
-) -> list[tuple[int, int]]:
-    pts: list[tuple[float, float]] = []
-    for i in range(samples + 1):
-        pts.append(_bezier_surface(i / samples, 0.0, mesh))
-    for j in range(1, samples + 1):
-        pts.append(_bezier_surface(1.0, j / samples, mesh))
-    for i in range(samples - 1, -1, -1):
-        pts.append(_bezier_surface(i / samples, 1.0, mesh))
-    for j in range(samples - 1, 0, -1):
-        pts.append(_bezier_surface(0.0, j / samples, mesh))
-    return [(int(x), int(y)) for x, y in pts]
-
-
 def linked_file_to_image(file_data: bytes) -> Optional[Image.Image]:
     if not file_data:
         return None
@@ -288,7 +273,6 @@ def composite_document(
     base_rgb = decode_image_data(doc)
     canvas_size = (doc.width, doc.height)
 
-    # Prefer pre-replace composite so we keep the real shirt under transparency
     if original_composite is not None:
         result = original_composite.convert("RGBA")
     else:
@@ -315,12 +299,12 @@ def composite_document(
         )
 
         if transform.has_mesh_warp:
-            warped = warp_to_mesh(img, transform.mesh_points, canvas_size)  # type: ignore
+            # Mesh may be in local SO space — normalise to document pixels
+            mesh = transform.document_mesh(canvas_size)
+            warped = warp_to_mesh(img, mesh, canvas_size)  # type: ignore
         else:
             warped = warp_to_quad(img, transform.corners, canvas_size)
 
-        # Only paint where the design has alpha. Transparent pixels leave
-        # the original composite (real shirt) visible — no white card.
         if layer.opacity < 255:
             a = warped.split()[3].point(lambda p: p * layer.opacity // 255)
             warped.putalpha(a)
