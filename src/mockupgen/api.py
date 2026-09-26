@@ -3,12 +3,14 @@
 Target usage:
 
     from mockupgen import Mockup
+    from mockupgen.log import setup_logging
+
+    setup_logging("DEBUG")   # optional — see every step
 
     m = Mockup.open("tshirt.psd")
     print(m.list_smart_objects())          # ['front', 'left', 'right']
     m.replace_smart_object("front", "design.png")
-    m.save("output.psd")                   # optional
-    m.export("result.png")                 # final mockup screenshot
+    m.save("output.psd")
 """
 
 from __future__ import annotations
@@ -16,8 +18,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import BinaryIO, Optional
 
+from mockupgen.log import get_logger, setup_logging
 from mockupgen.psd.document import PSDDocument
 from mockupgen.psd.layer_mask import LayerRecord
+from mockupgen.psd import smart_object as so_mod
+
+log = get_logger("api")
 
 
 class Mockup:
@@ -25,10 +31,27 @@ class Mockup:
 
     def __init__(self, document: PSDDocument):
         self._doc = document
+        self._raw = bytearray(document._raw)  # mutable working copy
+        self._linked: Optional[so_mod.LinkedFiles] = None
+        self._dirty = False
+        log.debug("Mockup created: %s", self)
+
+    # ------------------------------------------------------------------
+    # Factory
+    # ------------------------------------------------------------------
 
     @classmethod
     def open(cls, source: str | Path | bytes | BinaryIO) -> "Mockup":
+        log.info("Opening PSD: %s", source if not isinstance(source, (bytes, bytearray)) else f"<{len(source)} bytes>")
         doc = PSDDocument.open(source)
+        log.info(
+            "Opened %dx%d %s — %d layers, %d smart objects",
+            doc.width,
+            doc.height,
+            doc.header.color_mode_name if hasattr(doc.header, "color_mode_name") else "",
+            len(doc.layers()),
+            len(doc.smart_objects()),
+        )
         return cls(doc)
 
     # ------------------------------------------------------------------
@@ -44,31 +67,124 @@ class Mockup:
         return self._doc.height
 
     def list_layers(self) -> list[str]:
-        return [L.display_name for L in self._doc.layers()]
+        names = [L.display_name for L in self._doc.layers()]
+        log.debug("list_layers -> %s", names)
+        return names
 
     def list_smart_objects(self) -> list[str]:
-        """Return the names of all detected smart-object layers
-        (expected to be 'front', 'left', 'right', 'back', …)."""
-        return [L.display_name for L in self._doc.smart_objects()]
+        """Return names of all detected smart-object layers
+        (expected: 'front', 'left', 'right', 'back', …)."""
+        names = [L.display_name for L in self._doc.smart_objects()]
+        log.debug("list_smart_objects -> %s", names)
+        return names
 
     def find_layer(self, name: str) -> Optional[LayerRecord]:
-        return self._doc.find_layer(name)
+        layer = self._doc.find_layer(name)
+        log.debug("find_layer(%r) -> %s", name, layer.display_name if layer else None)
+        return layer
+
+    def list_linked_files(self) -> list[dict]:
+        """Return a summary of every embedded file in the lnk2 block."""
+        linked = self._ensure_linked()
+        return [
+            {
+                "uuid": f.uuid,
+                "filename": f.filename,
+                "datasize": f.datasize,
+                "is_psd": f.is_psd,
+                "is_png": f.is_png,
+                "is_jpeg": f.is_jpeg,
+            }
+            for f in linked.files
+        ]
 
     # ------------------------------------------------------------------
     # Core workflow
     # ------------------------------------------------------------------
 
+    def extract_smart_object(self, name: str, dest: str | Path | None = None) -> bytes:
+        """Extract the embedded file of a named smart object.
+
+        Returns the raw bytes.  If *dest* is given, also writes them to disk.
+        """
+        layer, linked_file = self._resolve(name)
+        data = linked_file.file_data
+        log.info(
+            "Extracted smart object %r -> %d bytes (%s)",
+            name,
+            len(data),
+            linked_file.filename,
+        )
+        if dest is not None:
+            Path(dest).write_bytes(data)
+            log.info("Wrote extracted file to %s", dest)
+        return data
+
     def replace_smart_object(self, name: str, image_path: str | Path) -> None:
-        """Replace the content of the smart object named `name`
+        """Replace the content of the smart object named *name*
         (e.g. 'front', 'left', 'right', 'back') with the given image.
 
-        Steps (implemented incrementally):
-        1. Locate the LayerRecord by name and confirm it is a smart object.
-        2. Extract its UUID from the PlacedLayer / SoLd tagged block.
-        3. Locate the matching linked-file entry inside the document-level lnk2 block.
-        4. Replace the embedded binary with a new minimal PSD/PNG of the design.
-        5. Update sizes so the file stays valid.
+        The image is converted to PNG and written into the linked-file
+        slot that the smart object references.  Call :meth:`save` afterwards.
         """
+        layer, linked_file = self._resolve(name)
+        log.info(
+            "replace_smart_object(%r) uuid=%s current_file=%r",
+            name,
+            linked_file.uuid,
+            linked_file.filename,
+        )
+
+        new_data = so_mod.image_to_png_bytes(image_path)
+
+        new_raw = so_mod.replace_linked_file_data(
+            raw_psd=bytes(self._raw),
+            linked_files=self._ensure_linked(),
+            target=linked_file,
+            new_file_data=new_data,
+        )
+        self._raw = bytearray(new_raw)
+        self._dirty = True
+        # Invalidate cached linked-files (offsets changed)
+        self._linked = None
+        log.info("Replacement done — call save() to write the file")
+
+    def save(self, path: str | Path) -> None:
+        """Write the (possibly modified) PSD to *path*."""
+        path = Path(path)
+        log.info("Saving PSD to %s (%d bytes, dirty=%s)", path, len(self._raw), self._dirty)
+        path.write_bytes(self._raw)
+        log.info("Saved successfully")
+        self._dirty = False
+
+    def export(self, path: str | Path) -> None:
+        """Composite / export the final mockup image.
+
+        Full re-compositing (warps, blend modes, effects) is Phase 5.
+        For now this raises so callers know it is not ready.
+        """
+        raise NotImplementedError(
+            "export() / compositing is Phase 5. "
+            "After replace + save, open the PSD in Photoshop to see the result, "
+            "or wait for the composite engine."
+        )
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _ensure_linked(self) -> so_mod.LinkedFiles:
+        if self._linked is None:
+            log.debug("Parsing linked files (lnk2) …")
+            # Re-parse from current raw so offsets stay valid after a replace
+            from mockupgen.psd.document import PSDDocument
+
+            # Build a temporary doc view over current raw for offset discovery
+            tmp = PSDDocument.open(bytes(self._raw))
+            self._linked = so_mod.load_linked_files_from_document(tmp)
+        return self._linked
+
+    def _resolve(self, name: str) -> tuple[LayerRecord, so_mod.LinkedFile]:
         layer = self._doc.find_layer(name)
         if layer is None:
             available = self.list_smart_objects()
@@ -83,30 +199,27 @@ class Mockup:
             raise RuntimeError(
                 f"Could not extract UUID from smart object layer {name!r}"
             )
+        log.debug("Layer %r -> uuid %s", name, uuid)
 
-        # The actual binary replace will be filled in next iteration
-        # once LinkedFile parsing is complete.
-        raise NotImplementedError(
-            f"Located smart object {name!r} (uuid={uuid}). "
-            "Linked-file binary replacement is the next step."
+        linked = self._ensure_linked()
+        linked_file = linked.find_by_uuid(uuid)
+        if linked_file is None:
+            # Fallback: try matching by layer name as filename stem
+            linked_file = linked.find_by_filename(name)
+        if linked_file is None:
+            known = [f"{f.filename} ({f.uuid})" for f in linked.files]
+            raise RuntimeError(
+                f"No linked file for uuid={uuid} (layer {name!r}). "
+                f"Known linked files: {known}"
+            )
+        log.debug(
+            "Resolved %r -> linked file %r (%d bytes)",
+            name,
+            linked_file.filename,
+            linked_file.datasize,
         )
-
-    def save(self, path: str | Path) -> None:
-        """Write the modified PSD back to disk.
-
-        Not yet implemented — requires a full writer that can rebuild
-        the Layer & Mask section with updated linked data.
-        """
-        raise NotImplementedError("PSD writing comes after linked-file replace.")
-
-    def export(self, path: str | Path) -> None:
-        """Composite the final mockup and save as PNG/JPG.
-
-        Full re-compositing (warps, blend modes, layer effects) is the
-        hardest remaining piece.  For now this is a placeholder.
-        """
-        raise NotImplementedError("Compositing / export comes in a later phase.")
+        return layer, linked_file
 
     def __repr__(self) -> str:
         so = self.list_smart_objects()
-        return f"<Mockup {self.width}x{self.height} smart_objects={so}>"
+        return f"<Mockup {self.width}x{self.height} smart_objects={so} dirty={self._dirty}>"
