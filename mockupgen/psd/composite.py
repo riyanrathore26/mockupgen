@@ -1,4 +1,4 @@
-"""Phase 5 — composite / export with perspective + bezier mesh warp."""
+"""Composite / export: decode image data, warp smart objects, alpha-composite."""
 
 from __future__ import annotations
 
@@ -6,12 +6,12 @@ import io
 import struct
 from typing import Optional
 
-from PIL import Image, ImageDraw, ImageFilter, ImageChops
+from PIL import Image, ImageChops, ImageFilter
 
-from mockupgen.compression.packbits import decode_packbits
 from mockupgen.log import get_logger
 from mockupgen.psd.document import PSDDocument
 from mockupgen.psd.placed_layer import get_placed_transform
+from mockupgen.compression.packbits import decode_packbits
 
 log = get_logger("composite")
 
@@ -19,80 +19,67 @@ MESH_GRID = 16
 
 
 def decode_image_data(doc: PSDDocument) -> Image.Image:
+    """Decode the flattened composite image (section 5) to RGB."""
     header = doc.header
     w, h = header.width, header.height
-    ch = header.channels
+    channels = header.channels
     depth = header.depth
     if depth != 8:
-        raise NotImplementedError(f"Only 8-bit depth supported for export, got {depth}")
+        raise NotImplementedError(f"Only 8-bit depth supported, got {depth}")
 
-    raw = doc.image_data.raw
-    comp = doc.image_data.compression
+    data = doc.image_data.data
+    compression = doc.image_data.compression
 
-    if comp == 0:
-        planes = _split_raw_planes(raw, w, h, ch)
-    elif comp == 1:
-        planes = _split_rle_planes(raw, w, h, ch)
+    if compression == 0:
+        raw = data
+        plane_size = w * h
+        planes = [raw[i * plane_size : (i + 1) * plane_size] for i in range(min(channels, 3))]
+    elif compression == 1:
+        planes = _decode_rle_planes(data, w, h, channels)
     else:
-        raise NotImplementedError(
-            f"Image-data compression {comp} not supported (0=raw, 1=RLE only)"
-        )
+        raise NotImplementedError(f"compression {compression}")
 
-    if ch >= 3:
-        bands = [Image.frombytes("L", (w, h), planes[i]) for i in range(3)]
-        return Image.merge("RGB", bands)
-    if ch == 1:
-        return Image.frombytes("L", (w, h), planes[0]).convert("RGB")
-    raise NotImplementedError(f"Unsupported channel count {ch}")
-
-
-def _split_raw_planes(raw: bytes, w: int, h: int, ch: int) -> list[bytes]:
-    plane_size = w * h
-    return [raw[c * plane_size : (c + 1) * plane_size] for c in range(ch)]
+    if len(planes) >= 3:
+        img = Image.merge("RGB", [Image.frombytes("L", (w, h), p) for p in planes[:3]])
+    elif len(planes) == 1:
+        img = Image.frombytes("L", (w, h), planes[0]).convert("RGB")
+    else:
+        img = Image.new("RGB", (w, h), (128, 128, 128))
+    return img
 
 
-def _split_rle_planes(raw: bytes, w: int, h: int, ch: int) -> list[bytes]:
-    n_rows = ch * h
-    header_bytes = n_rows * 2
-    if len(raw) < header_bytes:
-        raise ValueError("RLE image data too short for row-length table")
-    row_lengths = struct.unpack(f">{n_rows}H", raw[:header_bytes])
-    pos = header_bytes
-    planes: list[bytes] = []
-    for c in range(ch):
-        plane = bytearray()
-        for y in range(h):
-            rl = row_lengths[c * h + y]
-            plane.extend(decode_packbits(raw[pos : pos + rl], w))
-            pos += rl
-        planes.append(bytes(plane))
+def _decode_rle_planes(data: bytes, w: int, h: int, channels: int) -> list[bytes]:
+    n = channels * h
+    if len(data) < n * 2:
+        raise ValueError("RLE row-length table truncated")
+    lengths = struct.unpack(">" + "H" * n, data[: n * 2])
+    pos = n * 2
+    rows: list[bytes] = []
+    for length in lengths:
+        chunk = data[pos : pos + length]
+        pos += length
+        rows.append(decode_packbits(chunk, w))
+    planes = []
+    for c in range(channels):
+        plane = b"".join(rows[c * h : (c + 1) * h])
+        planes.append(plane)
     return planes
 
 
-def _find_perspective_coeffs(
-    src: list[tuple[float, float]],
-    dst: list[tuple[float, float]],
-) -> list[float]:
+def _find_perspective_coeffs(dst, src):
+    import numpy as np
+
     matrix = []
-    for (x, y), (u, v) in zip(src, dst):
+    for (x, y), (u, v) in zip(dst, src):
         matrix.append([x, y, 1, 0, 0, 0, -u * x, -u * y])
         matrix.append([0, 0, 0, x, y, 1, -v * x, -v * y])
-    B = [c for p in dst for c in p]
-    n = 8
-    M = [matrix[i][:] + [B[i]] for i in range(n)]
-    for col in range(n):
-        pivot = max(range(col, n), key=lambda r: abs(M[r][col]))
-        M[col], M[pivot] = M[pivot], M[col]
-        div = M[col][col]
-        if abs(div) < 1e-12:
-            raise ValueError("Degenerate perspective quad")
-        M[col] = [v / div for v in M[col]]
-        for row in range(n):
-            if row == col:
-                continue
-            factor = M[row][col]
-            M[row] = [a - factor * b for a, b in zip(M[row], M[col])]
-    return [M[i][n] for i in range(n)]
+    A = np.array(matrix, dtype=float)
+    B = np.array([u for (u, v) in src for u in (u, v)], dtype=float)
+    try:
+        res = np.linalg.solve(A, B)
+    except np.linalg.LinAlgError:
+        res = np.linalg.lstsq(A, B, rcond=None)[0]
+    return tuple(res.tolist())
 
 
 def warp_to_quad(
@@ -212,7 +199,7 @@ def linked_file_to_image(file_data: bytes) -> Optional[Image.Image]:
         try:
             return _decode_embedded_psd_image(file_data)
         except Exception as exc:
-            log.warning("Could not decode embedded PSD/PSB: %s", exp)
+            log.warning("Could not decode embedded PSD/PSB: %s", exc)
             return None
     return None
 
@@ -242,30 +229,32 @@ def _decode_embedded_psd_image(data: bytes) -> Image.Image:
     pos += 2
     raw = data[pos:]
     if compression == 0:
-        planes = _split_raw_planes(raw, width, height, channels)
+        plane_size = width * height
+        planes = [raw[i * plane_size : (i + 1) * plane_size] for i in range(min(channels, 4))]
     elif compression == 1:
-        planes = _split_rle_planes(raw, width, height, channels)
+        planes = _decode_rle_planes(raw, width, height, channels)
     else:
         raise NotImplementedError(f"embedded compression {compression}")
     if channels >= 3:
-        bands = [Image.frombytes("L", (width, height), planes[i]) for i in range(3)]
-        img = Image.merge("RGB", bands).convert("RGBA")
-        if channels >= 4:
-            img.putalpha(Image.frombytes("L", (width, height), planes[3]))
-        return img
-    raise NotImplementedError(f"embedded channels {channels}")
+        rgb = Image.merge("RGB", [Image.frombytes("L", (width, height), p) for p in planes[:3]])
+        if channels >= 4 and len(planes) > 3:
+            a = Image.frombytes("L", (width, height), planes[3])
+            rgb = rgb.convert("RGBA")
+            rgb.putalpha(a)
+            return rgb
+        return rgb.convert("RGBA")
+    return Image.frombytes("L", (width, height), planes[0]).convert("RGBA")
 
 
 def _apply_fabric_shading(
     warped: Image.Image,
-    shirt_source: Image.Image,
-    strength: float,
+    original_composite: Image.Image,
+    strength: float = 0.35,
 ) -> Image.Image:
     """Soft fabric folds from original composite high-pass."""
-    strength = max(0.0, min(1.0, strength))
-    if strength < 1e-6:
+    if strength <= 0:
         return warped
-
+    shirt_source = original_composite
     w, h = warped.size
     gray = shirt_source.convert("L").resize((w, h), Image.Resampling.BILINEAR)
     blur = gray.filter(ImageFilter.GaussianBlur(radius=18))
@@ -324,9 +313,20 @@ def composite_document(
             "yes" if transform.has_mesh_warp else "no",
         )
 
+        # Image is expected to match the smart-object native canvas size so
+        # local mesh UVs line up with the PlLd warp (Photopea behaviour).
+        local_size = (float(img.width), float(img.height))
+
         if transform.has_mesh_warp:
-            mesh = transform.document_mesh(canvas_size)
-            warped = warp_to_mesh(img, mesh, canvas_size)  # type: ignore
+            mesh = transform.document_mesh(canvas_size, local_size=local_size)
+            if mesh and len(mesh) == 16:
+                # Use the mesh envelope quad (corners of the 4x4 grid) for
+                # perspective placement. Full bicubic mesh over-warps extreme
+                # side-angle mockups into diamond shapes vs Photopea.
+                envelope = (mesh[0], mesh[3], mesh[15], mesh[12])
+                warped = warp_to_quad(img, envelope, canvas_size)
+            else:
+                warped = warp_to_mesh(img, mesh, canvas_size)  # type: ignore
         else:
             warped = warp_to_quad(img, transform.corners, canvas_size)
 
