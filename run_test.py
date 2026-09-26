@@ -55,7 +55,11 @@ def resize_texture(
     width: Optional[int] = None,
     height: Optional[int] = None,
 ) -> Path:
-    """Crop to visible content, then resize to exact width x height."""
+    """Crop content, then fit (contain) centered on transparent SO canvas.
+
+    Does NOT stretch. Keeps aspect ratio; design is centered with
+    transparent padding so size matches Photopea, not the full SO box.
+    """
     img = Image.open(image_path)
     if img.mode != "RGBA":
         img = img.convert("RGBA")
@@ -73,12 +77,24 @@ def resize_texture(
         img.save(out, "PNG")
         return out
 
-    if img.size != (width, height):
-        print(f"  resize {img.size[0]}x{img.size[1]} -> {width}x{height}")
-        img = img.resize((width, height), Image.Resampling.LANCZOS)
+    # Fit inside (contain) — never stretch
+    iw, ih = img.size
+    scale = min(width / iw, height / ih)
+    nw = max(1, int(round(iw * scale)))
+    nh = max(1, int(round(ih * scale)))
+    if (nw, nh) != (iw, ih):
+        print(f"  fit {iw}x{ih} -> {nw}x{nh} (canvas {width}x{height}, no stretch)")
+        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+
+    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    ox = (width - nw) // 2
+    oy = (height - nh) // 2
+    canvas.paste(img, (ox, oy), img)
+    if ox or oy:
+        print(f"  center offset ({ox}, {oy})")
 
     out = image_path.with_name(image_path.stem + f"_{width}x{height}.png")
-    img.save(out, "PNG")
+    canvas.save(out, "PNG")
     return out
 
 
