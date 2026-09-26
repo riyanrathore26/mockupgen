@@ -1,15 +1,4 @@
-"""Phase 5 — composite / export (perspective warp + optional soft fabric detail).
-
-Strategy (v3 — clean):
-1. Decode the flattened Image Data as the base canvas.
-2. Perspective-warp each replacement design onto its PlLd 4 corners.
-3. Optionally multiply a *subtle* high-pass fabric detail from the
-   original composite (strength ~0.25) so folds appear without blow-outs.
-4. Alpha-composite the warped design on top of the base (opaque design
-   fully covers the old artwork in that region).
-
-No harsh luminance remapping — that caused the white streak artifacts.
-"""
+"""Phase 5 — composite / export with perspective + bezier mesh warp."""
 
 from __future__ import annotations
 
@@ -17,7 +6,7 @@ import io
 import struct
 from typing import Optional
 
-from PIL import Image, ImageChops, ImageFilter
+from PIL import Image, ImageDraw
 
 from mockupgen.compression.packbits import decode_packbits
 from mockupgen.log import get_logger
@@ -26,9 +15,7 @@ from mockupgen.psd.placed_layer import get_placed_transform
 
 log = get_logger("composite")
 
-# How strongly to apply fabric-fold detail (0 = flat clean, 1 = full).
-# Keep low to avoid white blow-outs.
-FABRIC_STRENGTH = 0.25
+MESH_GRID = 16
 
 
 def decode_image_data(doc: PSDDocument) -> Image.Image:
@@ -110,12 +97,7 @@ def _find_perspective_coeffs(
 
 def warp_to_quad(
     src: Image.Image,
-    corners: tuple[
-        tuple[float, float],
-        tuple[float, float],
-        tuple[float, float],
-        tuple[float, float],
-    ],
+    corners: tuple,
     canvas_size: tuple[int, int],
 ) -> Image.Image:
     w, h = src.size
@@ -132,6 +114,110 @@ def warp_to_quad(
     )
 
 
+def _bernstein3(i: int, t: float) -> float:
+    return [1, 3, 3, 1][i] * (t ** i) * ((1 - t) ** (3 - i))
+
+
+def _bezier_surface(
+    u: float, v: float, pts: list[tuple[float, float]]
+) -> tuple[float, float]:
+    x = y = 0.0
+    for j in range(4):
+        for i in range(4):
+            b = _bernstein3(i, u) * _bernstein3(j, v)
+            px, py = pts[j * 4 + i]
+            x += b * px
+            y += b * py
+    return x, y
+
+
+def warp_to_mesh(
+    src: Image.Image,
+    mesh: list[tuple[float, float]],
+    canvas_size: tuple[int, int],
+    grid: int = MESH_GRID,
+) -> Image.Image:
+    """Warp src onto a 4x4 cubic bezier mesh via subdivided quads."""
+    if src.mode != "RGBA":
+        src = src.convert("RGBA")
+    cw, ch = canvas_size
+    out = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+    sw, sh = src.size
+
+    grid_pts: list[list[tuple[float, float]]] = []
+    for j in range(grid + 1):
+        v = j / grid
+        row = [_bezier_surface(i / grid, v, mesh) for i in range(grid + 1)]
+        grid_pts.append(row)
+
+    for j in range(grid):
+        for i in range(grid):
+            u0, u1 = i / grid, (i + 1) / grid
+            v0, v1 = j / grid, (j + 1) / grid
+            sx0, sx1 = u0 * sw, u1 * sw
+            sy0, sy1 = v0 * sh, v1 * sh
+            cell = src.crop(
+                (
+                    int(sx0),
+                    int(sy0),
+                    max(int(sx1), int(sx0) + 1),
+                    max(int(sy1), int(sy0) + 1),
+                )
+            )
+            if cell.size[0] < 1 or cell.size[1] < 1:
+                continue
+            cw_cell, ch_cell = cell.size
+            src_corners = [
+                (0.0, 0.0),
+                (float(cw_cell), 0.0),
+                (float(cw_cell), float(ch_cell)),
+                (0.0, float(ch_cell)),
+            ]
+            dst_corners = [
+                grid_pts[j][i],
+                grid_pts[j][i + 1],
+                grid_pts[j + 1][i + 1],
+                grid_pts[j + 1][i],
+            ]
+            xs = [p[0] for p in dst_corners]
+            ys = [p[1] for p in dst_corners]
+            bx0 = max(0, int(min(xs)) - 1)
+            by0 = max(0, int(min(ys)) - 1)
+            bx1 = min(cw, int(max(xs)) + 2)
+            by1 = min(ch, int(max(ys)) + 2)
+            if bx1 <= bx0 or by1 <= by0:
+                continue
+            local_dst = [(x - bx0, y - by0) for x, y in dst_corners]
+            try:
+                local_coeffs = _find_perspective_coeffs(list(local_dst), src_corners)
+            except ValueError:
+                continue
+            piece = cell.transform(
+                (bx1 - bx0, by1 - by0),
+                Image.Transform.PERSPECTIVE,
+                local_coeffs,
+                resample=Image.Resampling.BILINEAR,
+                fillcolor=(0, 0, 0, 0),
+            )
+            out.paste(piece, (bx0, by0), piece)
+    return out
+
+
+def _mesh_boundary_polygon(
+    mesh: list[tuple[float, float]], samples: int = 32
+) -> list[tuple[int, int]]:
+    pts: list[tuple[float, float]] = []
+    for i in range(samples + 1):
+        pts.append(_bezier_surface(i / samples, 0.0, mesh))
+    for j in range(1, samples + 1):
+        pts.append(_bezier_surface(1.0, j / samples, mesh))
+    for i in range(samples - 1, -1, -1):
+        pts.append(_bezier_surface(i / samples, 1.0, mesh))
+    for j in range(samples - 1, 0, -1):
+        pts.append(_bezier_surface(0.0, j / samples, mesh))
+    return [(int(x), int(y)) for x, y in pts]
+
+
 def linked_file_to_image(file_data: bytes) -> Optional[Image.Image]:
     if not file_data:
         return None
@@ -142,7 +228,7 @@ def linked_file_to_image(file_data: bytes) -> Optional[Image.Image]:
         try:
             return _decode_embedded_psd_image(file_data)
         except Exception as exc:
-            log.warning("Could not decode embedded PSD/PSB: %s", exc)
+            log.warning("Could not decode embedded PSD/PSB: %s", exp)
             return None
     return None
 
@@ -186,61 +272,21 @@ def _decode_embedded_psd_image(data: bytes) -> Image.Image:
     raise NotImplementedError(f"embedded channels {channels}")
 
 
-def _fabric_detail_map(
-    composite: Image.Image,
-    corners: tuple,
-    canvas_size: tuple[int, int],
-) -> Image.Image:
-    """Grayscale high-pass of the design region, centred on 128."""
-    solid = Image.new("RGBA", (64, 64), (255, 255, 255, 255))
-    footprint = warp_to_quad(solid, corners, canvas_size)
-    alpha = footprint.split()[3]
-
-    gray = composite.convert("L")
-    blur = gray.filter(ImageFilter.GaussianBlur(radius=12))
-    detail = ImageChops.subtract(gray, blur, scale=1.0, offset=128)
-
-    neutral = Image.new("L", canvas_size, 128)
-    return Image.composite(detail, neutral, alpha)
-
-
-def _apply_soft_fabric(
-    warped: Image.Image,
-    detail: Image.Image,
-    strength: float = FABRIC_STRENGTH,
-) -> Image.Image:
-    """Gently multiply fabric detail onto warped RGBA design."""
-    if strength <= 0:
-        return warped
-
-    warped = warped.convert("RGBA")
-    wr, wg, wb, wa = warped.split()
-
-    neutral = Image.new("L", detail.size, 128)
-    effective = Image.blend(neutral, detail, strength)
-
-    def soft_mul(ch: Image.Image, d: Image.Image) -> Image.Image:
-        m = ImageChops.multiply(ch, d)
-        return m.point(lambda x: min(255, int(x * 255 / 128)))
-
-    nr = soft_mul(wr, effective)
-    ng = soft_mul(wg, effective)
-    nb = soft_mul(wb, effective)
-    return Image.merge("RGBA", (nr, ng, nb, wa))
-
-
 def composite_document(
     doc: PSDDocument,
     *,
     overrides: Optional[dict[str, Image.Image]] = None,
     original_composite: Optional[Image.Image] = None,
-    fabric_strength: float = FABRIC_STRENGTH,
+    fabric_strength: float = 0.0,
 ) -> Image.Image:
-    """Build an exported RGB image of the document."""
+    """Build an exported RGB image of the document.
+
+    Uses bezier mesh warp when PlLd has customEnvelopeWarp mesh points
+    (gives the curved hem), otherwise falls back to 4-corner perspective.
+    """
     overrides = overrides or {}
     base_rgb = decode_image_data(doc)
     canvas_size = (doc.width, doc.height)
-    source = original_composite if original_composite is not None else base_rgb
 
     result = base_rgb.convert("RGBA")
 
@@ -258,18 +304,31 @@ def composite_document(
             continue
 
         log.info(
-            "Compositing smart object %r opacity=%d corners=%s fabric=%.2f",
+            "Compositing smart object %r opacity=%d mesh=%s",
             name,
             layer.opacity,
-            [(round(x, 1), round(y, 1)) for x, y in transform.corners],
-            fabric_strength,
+            "yes" if transform.has_mesh_warp else "no",
         )
 
-        warped = warp_to_quad(img, transform.corners, canvas_size)
+        shirt = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(shirt)
+        if transform.has_mesh_warp:
+            poly = _mesh_boundary_polygon(transform.mesh_points)  # type: ignore
+            draw.polygon(poly, fill=(248, 248, 248, 255))
+            warped = warp_to_mesh(img, transform.mesh_points, canvas_size)  # type: ignore
+        else:
+            draw.polygon(
+                [
+                    (int(transform.corners[0][0]), int(transform.corners[0][1])),
+                    (int(transform.corners[1][0]), int(transform.corners[1][1])),
+                    (int(transform.corners[2][0]), int(transform.corners[2][1])),
+                    (int(transform.corners[3][0]), int(transform.corners[3][1])),
+                ],
+                fill=(248, 248, 248, 255),
+            )
+            warped = warp_to_quad(img, transform.corners, canvas_size)
 
-        if fabric_strength > 0 and source is not None:
-            detail = _fabric_detail_map(source, transform.corners, canvas_size)
-            warped = _apply_soft_fabric(warped, detail, fabric_strength)
+        result = Image.alpha_composite(result, shirt)
 
         if layer.opacity < 255:
             a = warped.split()[3].point(lambda p: p * layer.opacity // 255)
