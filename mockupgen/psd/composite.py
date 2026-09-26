@@ -199,7 +199,7 @@ def linked_file_to_image(file_data: bytes) -> Optional[Image.Image]:
         try:
             return _decode_embedded_psd_image(file_data)
         except Exception as exc:
-            log.warning("Could not decode embedded PSD/PSB: %s", exc)
+            log.warning("Could not decode embedded PSD/PSB: %s", exp)
             return None
     return None
 
@@ -286,11 +286,10 @@ def composite_document(
 ) -> Image.Image:
     """Build an exported RGB image of the document.
 
-    When original_linked is provided (name -> original embedded bytes),
-    the original smart-object content is warped with the same transform and
-    its alpha is used as a mask on the new design. This makes the new design
-    inherit the exact visibility / clipping the mockup author created
-    (parts hidden by fabric curves stay hidden).
+    - Warps the new design with PlLd mesh / corners.
+    - Erases the original design from the base (punch-hole) so nothing double-prints.
+    - Multiplies the new design alpha by the original SO alpha (inherits author clipping).
+    - Uses fabric high-pass both for shading and to further hide the design in deep folds.
     """
     overrides = overrides or {}
     original_linked = original_linked or {}
@@ -315,48 +314,79 @@ def composite_document(
             log.debug("No PlLd for layer %r — skip", name)
             continue
 
+        has_mesh = transform.has_mesh_warp
         log.info(
             "Compositing smart object %r opacity=%d mesh=%s",
             name,
             layer.opacity,
-            "yes" if transform.has_mesh_warp else "no",
+            "yes" if has_mesh else "no",
         )
 
         local_size = (float(img.width), float(img.height))
 
-        if transform.has_mesh_warp:
-            mesh = transform.document_mesh(canvas_size, local_size=local_size)
-            warped = warp_to_mesh(img, mesh, canvas_size)  # type: ignore
-        else:
-            warped = warp_to_quad(img, transform.corners, canvas_size)
+        def _warp(src: Image.Image, loc_size: tuple[float, float]) -> Image.Image:
+            if has_mesh:
+                mesh = transform.document_mesh(canvas_size, local_size=loc_size)
+                return warp_to_mesh(src, mesh, canvas_size)  # type: ignore
+            return warp_to_quad(src, transform.corners, canvas_size)
 
-        # Inherit original SO visibility so design is clipped by shirt curves
+        warped = _warp(img, local_size)
+
+        # --- 1. Punch a hole: remove the old design from the base ---
         orig_data = original_linked.get(name)
+        orig_warped = None
         if orig_data is not None:
             try:
                 orig_img = linked_file_to_image(orig_data)
-                if orig_img is not None and orig_img.mode == "RGBA":
-                    if transform.has_mesh_warp:
-                        mesh = transform.document_mesh(
-                            canvas_size,
-                            local_size=(float(orig_img.width), float(orig_img.height)),
-                        )
-                        orig_warped = warp_to_mesh(orig_img, mesh, canvas_size)  # type: ignore
-                    else:
-                        orig_warped = warp_to_quad(orig_img, transform.corners, canvas_size)
-                    _, _, _, new_a = warped.split()
-                    _, _, _, orig_a = orig_warped.split()
-                    orig_a = orig_a.filter(ImageFilter.GaussianBlur(radius=0.8))
-                    combined_a = ImageChops.multiply(new_a, orig_a)
-                    warped.putalpha(combined_a)
-                    log.debug("Applied original SO alpha mask for %r", name)
-            except Exception as exp:
+                if orig_img is not None:
+                    if orig_img.mode != "RGBA":
+                        orig_img = orig_img.convert("RGBA")
+                    orig_warped = _warp(
+                        orig_img, (float(orig_img.width), float(orig_img.height))
+                    )
+                    _, _, _, oa = orig_warped.split()
+                    oa = oa.filter(ImageFilter.GaussianBlur(radius=1.2))
+                    if original_composite is not None:
+                        shirt = original_composite.convert("RGBA")
+                        shirt_blur = shirt.filter(ImageFilter.GaussianBlur(radius=8))
+                        result = Image.composite(shirt_blur, result, oa)
+                    log.debug("Punched hole for original design of %r", name)
+            except Exception as exc:
+                log.debug("Could not punch hole for %r: %s", name, exp)
+                orig_warped = None
+
+        # --- 2. Clip new design to original SO visibility ---
+        if orig_warped is not None:
+            try:
+                _, _, _, new_a = warped.split()
+                _, _, _, orig_a = orig_warped.split()
+                orig_a = orig_a.filter(ImageFilter.GaussianBlur(radius=0.6))
+                combined_a = ImageChops.multiply(new_a, orig_a)
+                warped.putalpha(combined_a)
+                log.debug("Applied original SO alpha mask for %r", name)
+            except Exception as exc:
                 log.debug("Could not apply original mask for %r: %s", name, exp)
 
+        # --- 3. Fabric shading + fold occlusion (dark folds hide design) ---
         if fabric_strength > 0 and original_composite is not None:
             warped = _apply_fabric_shading(
                 warped, original_composite, fabric_strength
             )
+            try:
+                w, h = warped.size
+                gray = original_composite.convert("L").resize((w, h), Image.Resampling.BILINEAR)
+                blur = gray.filter(ImageFilter.GaussianBlur(radius=14))
+                detail = ImageChops.subtract(gray, blur, scale=1.0, offset=128)
+                def fold_alpha(d: int) -> int:
+                    if d >= 128:
+                        return 255
+                    return max(100, int(140 + (d / 128.0) * 115))
+                fold_mod = detail.point(fold_alpha)
+                _, _, _, a = warped.split()
+                a = ImageChops.multiply(a, fold_mod)
+                warped.putalpha(a)
+            except Exception as exp:
+                log.debug("Fold occlusion failed for %r: %s", name, exp)
 
         if layer.opacity < 255:
             a = warped.split()[3].point(lambda p: p * layer.opacity // 255)
