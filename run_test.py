@@ -55,11 +55,7 @@ def resize_texture(
     width: Optional[int] = None,
     height: Optional[int] = None,
 ) -> Path:
-    """Crop content, then fit (contain) centered on a transparent SO canvas.
-
-    Does NOT stretch to fill. A square design on a tall smart-object
-    (e.g. 457x774) stays square and is centered — matching Photopea.
-    """
+    """Crop to visible content, then resize to exact width x height."""
     img = Image.open(image_path)
     if img.mode != "RGBA":
         img = img.convert("RGBA")
@@ -77,23 +73,12 @@ def resize_texture(
         img.save(out, "PNG")
         return out
 
-    iw, ih = img.size
-    scale = min(width / iw, height / ih)
-    nw = max(1, int(round(iw * scale)))
-    nh = max(1, int(round(ih * scale)))
-    if (nw, nh) != (iw, ih):
-        print(f"  fit {iw}x{ih} -> {nw}x{nh} (canvas {width}x{height})")
-        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
-
-    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    ox = (width - nw) // 2
-    oy = (height - nh) // 2
-    canvas.paste(img, (ox, oy), img)
-    if ox or oy:
-        print(f"  center offset ({ox}, {oy})")
+    if img.size != (width, height):
+        print(f"  resize {img.size[0]}x{img.size[1]} -> {width}x{height}")
+        img = img.resize((width, height), Image.Resampling.LANCZOS)
 
     out = image_path.with_name(image_path.stem + f"_{width}x{height}.png")
-    canvas.save(out, "PNG")
+    img.save(out, "PNG")
     return out
 
 
