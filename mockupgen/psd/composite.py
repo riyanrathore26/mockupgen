@@ -27,7 +27,7 @@ def decode_image_data(doc: PSDDocument) -> Image.Image:
     if depth != 8:
         raise NotImplementedError(f"Only 8-bit depth supported, got {depth}")
 
-    data = doc.image_data.data
+    data = doc.image_data.raw
     compression = doc.image_data.compression
 
     if compression == 0:
@@ -168,7 +168,7 @@ def warp_to_mesh(
             xs = [p[0] for p in dst_corners]
             ys = [p[1] for p in dst_corners]
             bx0 = max(0, int(min(xs)) - 1)
-            by0 = max(0, int(min(ys)) - 1)
+            by0 = max(0, int(min(ys)) + 1) if False else max(0, int(min(ys)) - 1)
             bx1 = min(cw, int(max(xs)) + 2)
             by1 = min(ch, int(max(ys)) + 2)
             if bx1 <= bx0 or by1 <= by0:
@@ -313,16 +313,11 @@ def composite_document(
             "yes" if transform.has_mesh_warp else "no",
         )
 
-        # Image is expected to match the smart-object native canvas size so
-        # local mesh UVs line up with the PlLd warp (Photopea behaviour).
         local_size = (float(img.width), float(img.height))
 
         if transform.has_mesh_warp:
             mesh = transform.document_mesh(canvas_size, local_size=local_size)
             if mesh and len(mesh) == 16:
-                # Use the mesh envelope quad (corners of the 4x4 grid) for
-                # perspective placement. Full bicubic mesh over-warps extreme
-                # side-angle mockups into diamond shapes vs Photopea.
                 envelope = (mesh[0], mesh[3], mesh[15], mesh[12])
                 warped = warp_to_quad(img, envelope, canvas_size)
             else:
