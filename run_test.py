@@ -76,22 +76,48 @@ def resize_texture(
     width: Optional[int] = None,
     height: Optional[int] = None,
 ) -> Path:
-    """Resize texture to exact width\u00d7height if both given."""
-    if not width or not height:
-        return image_path
+    """Crop to visible content, then resize to fill width x height.
 
+    Matches Photopea: design fills the smart-object canvas. Textures often
+    arrive as a small graphic on a large transparent canvas — without
+    cropping first, a 1800x1800 file with a centered square becomes a
+    tiny patch after resize.
+    """
     img = Image.open(image_path)
-    if img.size == (width, height):
-        return image_path
-
-    print(f"  \u2197 resize {img.size[0]}x{img.size[1]} \u2192 {width}x{height}")
     if img.mode == "P":
         img = img.convert("RGBA")
     elif "A" in img.getbands():
         img = img.convert("RGBA")
-    resized = img.resize((width, height), Image.Resampling.LANCZOS)
-    out = image_path.with_name(image_path.stem + f"_{width}x{height}.png")
-    resized.save(out, "PNG")
+    else:
+        img = img.convert("RGBA")
+
+    # Crop to non-transparent content
+    bbox = img.getbbox()
+    if bbox and bbox != (0, 0, img.size[0], img.size[1]):
+        print(
+            f"  crop content {img.size[0]}x{img.size[1]} -> "
+            f"{bbox[2] - bbox[0]}x{bbox[3] - bbox[1]}"
+        )
+        img = img.crop(bbox)
+
+    if width and height:
+        if img.size != (width, height):
+            print(f"  resize {img.size[0]}x{img.size[1]} -> {width}x{height}")
+            img = img.resize((width, height), Image.Resampling.LANCZOS)
+    elif width or height:
+        w, h = img.size
+        if width and not height:
+            height = max(1, int(h * width / w))
+        elif height and not width:
+            width = max(1, int(w * height / h))
+        img = img.resize((width, height), Image.Resampling.LANCZOS)
+
+    out = image_path.with_name(
+        image_path.stem
+        + (f"_{img.size[0]}x{img.size[1]}" if width else "_cropped")
+        + ".png"
+    )
+    img.save(out, "PNG")
     return out
 
 
