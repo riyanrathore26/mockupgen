@@ -2,13 +2,12 @@
 
 Target usage:
 
-    from mockupgen import Mockup
-    from mockupgen.log import setup_logging
+    from mockupgen import Mockup, setup_logging
 
-    setup_logging("DEBUG")   # optional — see every step
+    setup_logging("DEBUG")
 
     m = Mockup.open("tshirt.psd")
-    print(m.list_smart_objects())          # ['front', 'left', 'right']
+    print(m.list_smart_objects())
     m.replace_smart_object("front", "design.png")
     m.save("output.psd")
 """
@@ -18,7 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import BinaryIO, Optional
 
-from mockupgen.log import get_logger, setup_logging
+from mockupgen.log import get_logger
 from mockupgen.psd.document import PSDDocument
 from mockupgen.psd.layer_mask import LayerRecord
 from mockupgen.psd import smart_object as so_mod
@@ -31,18 +30,17 @@ class Mockup:
 
     def __init__(self, document: PSDDocument):
         self._doc = document
-        self._raw = bytearray(document._raw)  # mutable working copy
+        self._raw = bytearray(document._raw)
         self._linked: Optional[so_mod.LinkedFiles] = None
         self._dirty = False
         log.debug("Mockup created: %s", self)
 
-    # ------------------------------------------------------------------
-    # Factory
-    # ------------------------------------------------------------------
-
     @classmethod
     def open(cls, source: str | Path | bytes | BinaryIO) -> "Mockup":
-        log.info("Opening PSD: %s", source if not isinstance(source, (bytes, bytearray)) else f"<{len(source)} bytes>")
+        log.info(
+            "Opening PSD: %s",
+            source if not isinstance(source, (bytes, bytearray)) else f"<{len(source)} bytes>",
+        )
         doc = PSDDocument.open(source)
         log.info(
             "Opened %dx%d %s — %d layers, %d smart objects",
@@ -53,10 +51,6 @@ class Mockup:
             len(doc.smart_objects()),
         )
         return cls(doc)
-
-    # ------------------------------------------------------------------
-    # Inspection
-    # ------------------------------------------------------------------
 
     @property
     def width(self) -> int:
@@ -72,8 +66,6 @@ class Mockup:
         return names
 
     def list_smart_objects(self) -> list[str]:
-        """Return names of all detected smart-object layers
-        (expected: 'front', 'left', 'right', 'back', …)."""
         names = [L.display_name for L in self._doc.smart_objects()]
         log.debug("list_smart_objects -> %s", names)
         return names
@@ -84,7 +76,6 @@ class Mockup:
         return layer
 
     def list_linked_files(self) -> list[dict]:
-        """Return a summary of every embedded file in the lnk2 block."""
         linked = self._ensure_linked()
         return [
             {
@@ -98,15 +89,7 @@ class Mockup:
             for f in linked.files
         ]
 
-    # ------------------------------------------------------------------
-    # Core workflow
-    # ------------------------------------------------------------------
-
     def extract_smart_object(self, name: str, dest: str | Path | None = None) -> bytes:
-        """Extract the embedded file of a named smart object.
-
-        Returns the raw bytes.  If *dest* is given, also writes them to disk.
-        """
         layer, linked_file = self._resolve(name)
         data = linked_file.file_data
         log.info(
@@ -121,11 +104,10 @@ class Mockup:
         return data
 
     def replace_smart_object(self, name: str, image_path: str | Path) -> None:
-        """Replace the content of the smart object named *name*
-        (e.g. 'front', 'left', 'right', 'back') with the given image.
+        """Replace the content of the smart object named *name* with the image.
 
-        The image is converted to PNG and written into the linked-file
-        slot that the smart object references.  Call :meth:`save` afterwards.
+        The image is wrapped as a minimal PSD (required by Photopea/Photoshop)
+        and written into the linked-file slot. Call :meth:`save` afterwards.
         """
         layer, linked_file = self._resolve(name)
         log.info(
@@ -135,7 +117,8 @@ class Mockup:
             linked_file.filename,
         )
 
-        new_data = so_mod.image_to_png_bytes(image_path)
+        # Build a real PSD, not a raw PNG — avoids "unknown linked layer"
+        new_data = so_mod.image_to_minimal_psd(image_path)
 
         new_raw = so_mod.replace_linked_file_data(
             raw_psd=bytes(self._raw),
@@ -145,41 +128,29 @@ class Mockup:
         )
         self._raw = bytearray(new_raw)
         self._dirty = True
-        # Invalidate cached linked-files (offsets changed)
-        self._linked = None
+        self._linked = None  # offsets changed
         log.info("Replacement done — call save() to write the file")
 
     def save(self, path: str | Path) -> None:
-        """Write the (possibly modified) PSD to *path*."""
         path = Path(path)
-        log.info("Saving PSD to %s (%d bytes, dirty=%s)", path, len(self._raw), self._dirty)
+        log.info(
+            "Saving PSD to %s (%d bytes, dirty=%s)", path, len(self._raw), self._dirty
+        )
         path.write_bytes(self._raw)
         log.info("Saved successfully")
         self._dirty = False
 
     def export(self, path: str | Path) -> None:
-        """Composite / export the final mockup image.
-
-        Full re-compositing (warps, blend modes, effects) is Phase 5.
-        For now this raises so callers know it is not ready.
-        """
         raise NotImplementedError(
             "export() / compositing is Phase 5. "
-            "After replace + save, open the PSD in Photoshop to see the result, "
-            "or wait for the composite engine."
+            "After replace + save, open the PSD in Photopea or Photoshop to see the result."
         )
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
 
     def _ensure_linked(self) -> so_mod.LinkedFiles:
         if self._linked is None:
             log.debug("Parsing linked files (lnk2) …")
-            # Re-parse from current raw so offsets stay valid after a replace
             from mockupgen.psd.document import PSDDocument
 
-            # Build a temporary doc view over current raw for offset discovery
             tmp = PSDDocument.open(bytes(self._raw))
             self._linked = so_mod.load_linked_files_from_document(tmp)
         return self._linked
@@ -204,7 +175,6 @@ class Mockup:
         linked = self._ensure_linked()
         linked_file = linked.find_by_uuid(uuid)
         if linked_file is None:
-            # Fallback: try matching by layer name as filename stem
             linked_file = linked.find_by_filename(name)
         if linked_file is None:
             known = [f"{f.filename} ({f.uuid})" for f in linked.files]
