@@ -30,14 +30,7 @@ from mockupgen.log import get_logger
 
 log = get_logger("smart_object")
 
-# Max long-edge for embedded design. Mockup smart-object canvases are small
-# (often ~400–800px). Huge textures only bloat the file and break Photopea.
 MAX_DESIGN_EDGE = 2500
-
-
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -46,13 +39,13 @@ class LinkedFile:
 
     uuid: str
     filename: str
-    filetype: bytes  # e.g. b'8BPB', b'8BPS', b'png '
+    filetype: bytes
     creator: bytes
     datasize: int
     file_data: bytes
     item_offset: int = 0
-    item_size: int = 0  # declared u64 (excludes the 8-byte size field)
-    actual_span: int = 0  # real bytes until next item (includes padding)
+    item_size: int = 0
+    actual_span: int = 0
     file_offset_in_item: int = 0
     raw_item: bytes = field(default_factory=bytes, repr=False)
 
@@ -92,9 +85,59 @@ class LinkedFiles:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Parser
-# ---------------------------------------------------------------------------
+def linked_file_dimensions(lf: "LinkedFile") -> tuple[int, int] | None:
+    """Return (width, height) of an embedded linked file, if readable."""
+    data = lf.file_data
+    if not data:
+        return None
+    if data[:4] == b"8BPS" and len(data) >= 22:
+        h = struct.unpack(">I", data[14:18])[0]
+        w = struct.unpack(">I", data[18:22])[0]
+        if 0 < w < 30000 and 0 < h < 30000:
+            return (w, h)
+    if data[:4] == b"\x89PNG" or data[:3] == b"\xff\xd8\xff" or data[:4] == b"GIF8":
+        try:
+            from PIL import Image
+            im = Image.open(io.BytesIO(data))
+            return im.size
+        except Exception:
+            return None
+    return None
+
+
+def prepare_design_on_canvas(
+    image_path: str | Path,
+    canvas_w: int,
+    canvas_h: int,
+):
+    """Place design on a transparent canvas matching the smart-object size.
+
+    Matches Photopea/Photoshop SO replacement: the smart-object document has a
+    fixed pixel size; the design is fit (contain, no stretch) and centred so
+    aspect ratio and transparent padding are preserved.
+    """
+    from PIL import Image
+
+    img = Image.open(image_path).convert("RGBA")
+    iw, ih = img.size
+    if iw < 1 or ih < 1:
+        return Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+
+    scale = min(canvas_w / iw, canvas_h / ih)
+    nw = max(1, round(iw * scale))
+    nh = max(1, round(ih * scale))
+    if (nw, nh) != (iw, ih):
+        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    ox = (canvas_w - nw) // 2
+    oy = (canvas_h - nh) // 2
+    canvas.paste(img, (ox, oy), img)
+    log.info(
+        "Prepared design %dx%d -> canvas %dx%d (placed %dx%d at %d,%d)",
+        iw, ih, canvas_w, canvas_h, nw, nh, ox, oy,
+    )
+    return canvas
 
 
 def parse_linked_files(
@@ -233,18 +276,8 @@ def _parse_single_item(
     )
 
 
-# ---------------------------------------------------------------------------
-# High-level helpers
-# ---------------------------------------------------------------------------
-
-
 def load_linked_files_from_document(doc) -> LinkedFiles:
-    """Locate and parse the document-level lnk2/lnkE embedded-files block.
-
-    Prefers the already-parsed tagged block, but falls back to scanning the
-    raw PSD bytes so we still work when the layer-mask walker missed lnk2
-    (padding gaps, unusual block order, etc.).
-    """
+    """Locate and parse the document-level lnk2/lnkE embedded-files block."""
     raw = doc._raw
     block = doc.layer_mask.linked_layers_block()
 
@@ -254,17 +287,14 @@ def load_linked_files_from_document(doc) -> LinkedFiles:
     data_abs_start = 0
 
     if block is not None and block.data:
-        # Prefer precise offsets from a raw signature scan so splice works
         for sig in (b"8BIMlnk2", b"8BIMlnkE"):
             abs_sig = raw.find(sig)
             if abs_sig >= 0:
                 break
         if abs_sig < 0:
-            # Use block payload alone (read-only; splice may be limited)
             log.warning("lnk2 tagged block present but signature not found in raw")
             return parse_linked_files(block.data)
         length_field_abs = abs_sig + 8
-        # 8B64 uses 8-byte length; plain 8BIM uses 4-byte
         if raw[abs_sig:abs_sig + 4] == b"8B64":
             data_len = struct.unpack(">Q", raw[length_field_abs:length_field_abs + 8])[0]
             data_abs_start = length_field_abs + 8
@@ -287,7 +317,6 @@ def load_linked_files_from_document(doc) -> LinkedFiles:
             data_len = struct.unpack(">I", raw[length_field_abs:length_field_abs + 4])[0]
             data_abs_start = length_field_abs + 4
 
-    # Clamp to file size
     if data_abs_start + data_len > len(raw):
         data_len = max(0, len(raw) - data_abs_start)
 
