@@ -1,29 +1,12 @@
 #!/usr/bin/env python3
 """Dynamic mockup runner — replaces Photopea with mockupgen.
 
-Accepts a JSON payload (file path, stdin, or --payload string) with:
-
-    {
-      "primarySide": "front",
-      "color": "#FFFFFF",
-      "psdUrl": "https://.../mockup.psd",
-      "smart_objects_dimensions": {
-        "front": {"width": 457, "height": 774},
-        "left":  {"width": 142, "height": 141},
-        "right": {"width": 142, "height": 141}
-      },
-      "textures": {
-        "front": {"textureUrl": "https://.../design.png"},
-        "left":  {"textureUrl": "https://.../left.png"}
-      },
-      "output": "tests/exported.png"
-    }
+Accepts a JSON payload (file path, stdin, or --payload string).
 
 Usage:
     python run_test.py payload.json
     python run_test.py --payload '{"psdUrl":"...", ...}'
-    echo '{...}' | python run_test.py
-    python run_test.py --local   # tests/ fixtures
+    python run_test.py --local
 """
 
 from __future__ import annotations
@@ -45,13 +28,10 @@ DEFAULT_TIMEOUT = 120
 
 
 def download(url: str, dest: Path, *, timeout: int = DEFAULT_TIMEOUT) -> Path:
-    """Download *url* to *dest*. Returns *dest*."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     print(f"  \u2193 {url[:80]}{'\u2026' if len(url) > 80 else ''}")
     req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "mockupgen/0.1"},
-        method="GET",
+        url, headers={"User-Agent": "mockupgen/0.1"}, method="GET"
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -60,7 +40,6 @@ def download(url: str, dest: Path, *, timeout: int = DEFAULT_TIMEOUT) -> Path:
         raise RuntimeError(f"Download failed ({e.code}): {url[:60]}\u2026") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"Download failed: {e.reason}") from e
-
     dest.write_bytes(data)
     print(f"    \u2192 {dest} ({len(data):,} bytes)")
     return dest
@@ -76,22 +55,15 @@ def resize_texture(
     width: Optional[int] = None,
     height: Optional[int] = None,
 ) -> Path:
-    """Crop to visible content, then resize to fill width x height.
+    """Crop content, then fit (contain) centered on a transparent SO canvas.
 
-    Matches Photopea: design fills the smart-object canvas. Textures often
-    arrive as a small graphic on a large transparent canvas — without
-    cropping first, a 1800x1800 file with a centered square becomes a
-    tiny patch after resize.
+    Does NOT stretch to fill. A square design on a tall smart-object
+    (e.g. 457x774) stays square and is centered — matching Photopea.
     """
     img = Image.open(image_path)
-    if img.mode == "P":
-        img = img.convert("RGBA")
-    elif "A" in img.getbands():
-        img = img.convert("RGBA")
-    else:
+    if img.mode != "RGBA":
         img = img.convert("RGBA")
 
-    # Crop to non-transparent content
     bbox = img.getbbox()
     if bbox and bbox != (0, 0, img.size[0], img.size[1]):
         print(
@@ -100,29 +72,32 @@ def resize_texture(
         )
         img = img.crop(bbox)
 
-    if width and height:
-        if img.size != (width, height):
-            print(f"  resize {img.size[0]}x{img.size[1]} -> {width}x{height}")
-            img = img.resize((width, height), Image.Resampling.LANCZOS)
-    elif width or height:
-        w, h = img.size
-        if width and not height:
-            height = max(1, int(h * width / w))
-        elif height and not width:
-            width = max(1, int(w * height / h))
-        img = img.resize((width, height), Image.Resampling.LANCZOS)
+    if not width or not height:
+        out = image_path.with_name(image_path.stem + "_cropped.png")
+        img.save(out, "PNG")
+        return out
 
-    out = image_path.with_name(
-        image_path.stem
-        + (f"_{img.size[0]}x{img.size[1]}" if width else "_cropped")
-        + ".png"
-    )
-    img.save(out, "PNG")
+    iw, ih = img.size
+    scale = min(width / iw, height / ih)
+    nw = max(1, int(round(iw * scale)))
+    nh = max(1, int(round(ih * scale)))
+    if (nw, nh) != (iw, ih):
+        print(f"  fit {iw}x{ih} -> {nw}x{nh} (canvas {width}x{height})")
+        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+
+    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    ox = (width - nw) // 2
+    oy = (height - nh) // 2
+    canvas.paste(img, (ox, oy), img)
+    if ox or oy:
+        print(f"  center offset ({ox}, {oy})")
+
+    out = image_path.with_name(image_path.stem + f"_{width}x{height}.png")
+    canvas.save(out, "PNG")
     return out
 
 
 def run_payload(payload: dict[str, Any], *, work_dir: Path) -> Path:
-    """Execute one mockup job from a payload dict. Returns export path."""
     psd_url = payload.get("psdUrl") or payload.get("psd_url")
     textures = payload.get("textures") or {}
     dimensions = (
@@ -198,7 +173,7 @@ def run_payload(payload: dict[str, Any], *, work_dir: Path) -> Path:
                 layer_name = name
                 break
         if layer_name is None:
-            print(f"  \u26a0 no layer named {side!r} \u2014 skipping (available: {available})")
+            print(f"  \u26a0 no layer named {side!r} — skipping")
             continue
         print(f"  replace {layer_name!r} \u2190 {tex_path.name}")
         m.replace_smart_object(layer_name, tex_path)
@@ -219,7 +194,7 @@ def run_payload(payload: dict[str, Any], *, work_dir: Path) -> Path:
 
 
 def run_local_fixture() -> Path:
-    print("No payload \u2014 using local fixtures (tests/mockup.psd)")
+    print("No payload — using local fixtures")
     m = Mockup.open("tests/mockup.psd")
     print("Smart objects:", m.list_smart_objects())
     tex = Path("tests/texture.png")
@@ -235,28 +210,22 @@ def run_local_fixture() -> Path:
 def load_payload(args: argparse.Namespace) -> Optional[dict[str, Any]]:
     if args.payload:
         return json.loads(args.payload)
-
     if args.file:
         return json.loads(Path(args.file).read_text(encoding="utf-8"))
-
     if args.input and args.input != "-":
         p = Path(args.input)
         if p.exists():
             return json.loads(p.read_text(encoding="utf-8"))
         raise FileNotFoundError(f"Payload file not found: {p}")
-
     if args.input == "-" or (not sys.stdin.isatty() and not args.local):
         raw = sys.stdin.read().strip()
         if raw:
             return json.loads(raw)
-
     return None
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="mockupgen dynamic runner \u2014 PSD + texture URLs \u2192 exported PNG",
-    )
+    parser = argparse.ArgumentParser(description="mockupgen dynamic runner")
     parser.add_argument("input", nargs="?", help="JSON payload file, or '-' for stdin")
     parser.add_argument("--payload", "-p", help="JSON payload as a string")
     parser.add_argument("--file", "-f", help="JSON payload file")
@@ -264,12 +233,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--work-dir", default=None, help="Directory for downloads")
     parser.add_argument("--local", action="store_true", help="Local fixture test")
     parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
     args = parser.parse_args(argv)
-
     setup_logging(args.log_level)
 
     if args.local:
@@ -293,7 +259,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                 str(Path(out).resolve()) if not Path(out).is_absolute() else out
             )
             run_payload(payload, work_dir=Path(tmp))
-
     return 0
 
 
