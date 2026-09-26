@@ -1,0 +1,24 @@
+{
+    "primarySide": "front",
+    "color": "#FFFFFF",
+    "psdUrl": "https://loomerangmodelsnew-in.s3.amazonaws.com/ed1dc38c-5733-489f-bc2b-c215b29b69e2.psd?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA43JRYXK63UIBEWFI%2F20260926%2Fap-south-1%2Fs3%2Faws4_request&X-Amz-Date=20260926T053854Z&X-Amz-Expires=24000&X-Amz-SignedHeaders=host&X-Amz-Signature=058924d5cfa2c29d6c63c08a9f08480fc88fb3f4216e8a696c1049bd8beeb61c",
+    "smart_objects_dimensions": {
+        "left": {
+            "width": 142,
+            "height": 141
+        },
+        "front": {
+            "width": 457,
+            "height": 774
+        },
+        "right": {
+            "width": 142,
+            "height": 141
+        }
+    },
+    "textures": {
+        "front": {
+            "textureUrl": "https://wyidesigns-in.s3.ap-south-1.amazonaws.com/dc2b264a-4cfa-4ebf-b610-2d0307f15cf7.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=ASIA43JRYXK6T7TNXSHN%2F20260926%2Fap-south-1%2Fs3%2Faws4_request&X-Amz-Date=20260926T033739Z&X-Amz-Expires=24000&X-Amz-Security-Token=IQoJb3JpZ2luX2VjEDQaCmFwLXNvdXRoLTEiRzBFAiBdN7tn7F%2FHrOEoXKSu5zb%2FFjSpu7r10HF96ixP4HpovQIhAO%2FH0jnbYlEyS3EGKLcHTXMmRcLAvUT9uVotiRoFhr4QKvoDCP3%2F%2F%2F%2F%2F%2F%2F%2F%2F%2FwEQARoMODgzMjU3MDMxMzU3IgwTEmUFtHGIs12DQtIqzgMj6G83suKTQeRwTPyEwR5ZdXYTcFb09%2BGUk%2FAc8VFN0jxT6h7Kfv5wbr14usOczXhl1rqX7I2UxhGXkpGIfCabg6Ah3skezoEUgffkWwz%2FSQ8ADvJy%2BfFe2zKXGpfLNdxIgs53BbnLii6HZMkhH6x6eKOPwBdcvUMhL7U%2FwCiK7%2F8gvahAmG0wP2zPxHdMzmI7KntbfTVyCdxuFpkE7nKe6M0mwxUs1SsprWq1ldDlwHC8XQIZ%2FjgZmB5yDEAVPBdXTKQeDH5QnNlZyFYF%2BJ1wCsdyBYrZEX4owGQ6JZhCAksCEB%2B6BEvQ0k5JD5fqaV%2BltnboY85%2B%2FK%2B8YIo1WSoJgj9B1RagYymvzFxU30mCkZOFIhpH%2BbD0SaQTEIg5MZuNsKw5wq2TXHYKOnYXopf6EwNjHrZrpSgvojUK63QoLOsxcJUzntPEeXSPootSsjA%2F2ttpn5PnegiFUhhmvV1lGS1uLEp5ps39uKt9j6ytoWgGSfHvzXVUbQ%2F6PQGBuRUmCzyVXYTY5ibpYrdbusq8ojHWJe77lUQ9c9E%2FRX86z1cfTnQ62r20rgN90cblgIsZgig6dMsyHZKGgK6jqN8ZVUjBZEYyLrtWDt9U7A0wwvvc1QY6oQE4160oW1T3yIwCuK1Vy7Ujwzfe998jfpmoSBMUkwTEGuk%2F1weKmcIfkEpa7TLXshbl92RUbBZt6BQm40QrWzj17v0As8wy6Z9UflSGbnvAvhmQEHAjHN8WrQBqfXD5sL40pI86Kda9hHT0658VNNI8jxBXQauVaIUqRH6H8D4YT02EhkiCcgWB7fHcTrJc9mIOhkvl%2B2bh7ZsB492XkdpG9g%3D%3D&X-Amz-Signature=23268e0b39377c0e1ad8f624c15e321a02c8b98de38d05898e5d1c0b9368d1fe&X-Amz-SignedHeaders=host&x-amz-checksum-mode=ENABLED&x-id=GetObject"
+        }
+    }
+}
