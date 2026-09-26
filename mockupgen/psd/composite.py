@@ -199,7 +199,7 @@ def linked_file_to_image(file_data: bytes) -> Optional[Image.Image]:
         try:
             return _decode_embedded_psd_image(file_data)
         except Exception as exc:
-            log.warning("Could not decode embedded PSD/PSB: %s", exp)
+            log.warning("Could not decode embedded PSD/PSB: %s", exc)
             return None
     return None
 
@@ -225,6 +225,8 @@ def _decode_embedded_psd_image(data: bytes) -> Image.Image:
     else:
         lm_len = struct.unpack(">Q", data[pos : pos + 8])[0]
         pos += 8 + lm_len
+    if pos + 2 > len(data):
+        raise ValueError("embedded PSB truncated before compression field")
     compression = struct.unpack(">H", data[pos : pos + 2])[0]
     pos += 2
     raw = data[pos:]
@@ -352,7 +354,7 @@ def composite_document(
                         result = Image.composite(shirt_blur, result, oa)
                     log.debug("Punched hole for original design of %r", name)
             except Exception as exc:
-                log.debug("Could not punch hole for %r: %s", name, exp)
+                log.debug("Could not punch hole for %r: %s", name, exc)
                 orig_warped = None
 
         # --- 2. Clip new design to original SO visibility ---
@@ -365,7 +367,7 @@ def composite_document(
                 warped.putalpha(combined_a)
                 log.debug("Applied original SO alpha mask for %r", name)
             except Exception as exc:
-                log.debug("Could not apply original mask for %r: %s", name, exp)
+                log.debug("Could not apply original mask for %r: %s", name, exc)
 
         # --- 3. Fabric shading + fold occlusion (dark folds hide design) ---
         if fabric_strength > 0 and original_composite is not None:
@@ -385,8 +387,8 @@ def composite_document(
                 _, _, _, a = warped.split()
                 a = ImageChops.multiply(a, fold_mod)
                 warped.putalpha(a)
-            except Exception as exp:
-                log.debug("Fold occlusion failed for %r: %s", name, exp)
+            except Exception as exc:
+                log.debug("Fold occlusion failed for %r: %s", name, exc)
 
         if layer.opacity < 255:
             a = warped.split()[3].point(lambda p: p * layer.opacity // 255)
