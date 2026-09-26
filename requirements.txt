@@ -1,5 +1,2 @@
 # Runtime dependencies (keep minimal)
 Pillow>=10.0.0
-
-# Dev / testing only
-pytest>=7.0.0
