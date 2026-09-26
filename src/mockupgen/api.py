@@ -1,16 +1,4 @@
-"""Public high-level API for mockupgen.
-
-Target usage:
-
-    from mockupgen import Mockup, setup_logging
-
-    setup_logging("DEBUG")
-
-    m = Mockup.open("tshirt.psd")
-    print(m.list_smart_objects())
-    m.replace_smart_object("front", "design.png")
-    m.save("output.psd")
-"""
+"""Public high-level API for mockupgen."""
 
 from __future__ import annotations
 
@@ -104,10 +92,10 @@ class Mockup:
         return data
 
     def replace_smart_object(self, name: str, image_path: str | Path) -> None:
-        """Replace the content of the smart object named *name* with the image.
+        """Replace smart-object content with the given image (PNG embed).
 
-        The image is wrapped as a minimal PSD (required by Photopea/Photoshop)
-        and written into the linked-file slot. Call :meth:`save` afterwards.
+        Large images are auto-resized so Photopea does not report the file
+        as damaged. Call :meth:`save` afterwards.
         """
         layer, linked_file = self._resolve(name)
         log.info(
@@ -117,8 +105,7 @@ class Mockup:
             linked_file.filename,
         )
 
-        # Build a real PSD, not a raw PNG — avoids "unknown linked layer"
-        new_data = so_mod.image_to_minimal_psd(image_path)
+        new_data = so_mod.image_to_embed_bytes(image_path)
 
         new_raw = so_mod.replace_linked_file_data(
             raw_psd=bytes(self._raw),
@@ -128,7 +115,7 @@ class Mockup:
         )
         self._raw = bytearray(new_raw)
         self._dirty = True
-        self._linked = None  # offsets changed
+        self._linked = None
         log.info("Replacement done — call save() to write the file")
 
     def save(self, path: str | Path) -> None:
@@ -143,7 +130,7 @@ class Mockup:
     def export(self, path: str | Path) -> None:
         raise NotImplementedError(
             "export() / compositing is Phase 5. "
-            "After replace + save, open the PSD in Photopea or Photoshop to see the result."
+            "After replace + save, open the PSD in Photopea or Photoshop."
         )
 
     def _ensure_linked(self) -> so_mod.LinkedFiles:

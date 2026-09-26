@@ -4,12 +4,17 @@ Responsibilities:
 1. Parse the document-level lnk2 / lnkE block into LinkedFile entries
 2. Map a smart-object layer UUID -> its LinkedFile
 3. Extract the embedded binary (PSD/PSB/PNG/JPEG)
-4. Replace that binary with a new minimal PSD of the design image
-   and patch size fields so Photopea / Photoshop still resolve all UUIDs
+4. Replace that binary with a new image (PNG) and patch size fields
+   so Photopea / Photoshop still resolve all UUIDs
 
 Important size-field rule (Adobe):
   The u64 at the start of each liFD item is the length of everything
   AFTER that u64 (i.e. it does NOT include itself).
+
+Photopea notes:
+  - Embedding a huge raw PSD (e.g. 4800x7500 = 108MB) often shows as "damaged"
+  - This mockup already has a PNG linked file, so PNG embeds are accepted
+  - Large designs are auto-resized (long edge capped) for mockup use
 """
 
 from __future__ import annotations
@@ -25,6 +30,11 @@ from mockupgen.log import get_logger
 
 log = get_logger("smart_object")
 
+# Max long-edge for embedded design. Mockup smart-object canvases are small
+# (often ~400–800px). Huge textures only bloat the file and break Photopea.
+MAX_DESIGN_EDGE = 2500
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -36,15 +46,14 @@ class LinkedFile:
 
     uuid: str
     filename: str
-    filetype: bytes  # e.g. b'8BPB', b'8BPS', or blank for PNG/JPEG
+    filetype: bytes  # e.g. b'8BPB', b'8BPS', b'png '
     creator: bytes
-    datasize: int  # size of the pure file payload
-    file_data: bytes  # the actual embedded file bytes
-    # Offsets relative to the start of the *lnk2 data payload*
-    item_offset: int = 0  # where this item's size field starts
-    item_size: int = 0  # declared u64 size (excludes the 8-byte size field)
+    datasize: int
+    file_data: bytes
+    item_offset: int = 0
+    item_size: int = 0  # declared u64 (excludes the 8-byte size field)
     actual_span: int = 0  # real bytes until next item (includes padding)
-    file_offset_in_item: int = 0  # where file_data starts inside the item
+    file_offset_in_item: int = 0
     raw_item: bytes = field(default_factory=bytes, repr=False)
 
     @property
@@ -62,12 +71,9 @@ class LinkedFile:
 
 @dataclass
 class LinkedFiles:
-    """All linked files found in the document-level lnk2 block."""
-
     files: list[LinkedFile] = field(default_factory=list)
-    # Absolute offsets inside the original PSD file (for surgical patching)
-    lnk2_data_abs_start: int = 0  # byte offset of lnk2 payload in the PSD
-    lnk2_length_field_abs: int = 0  # byte offset of the 4-byte length field
+    lnk2_data_abs_start: int = 0
+    lnk2_length_field_abs: int = 0
     lnk2_data_length: int = 0
 
     def find_by_uuid(self, uuid: str) -> Optional[LinkedFile]:
@@ -97,7 +103,6 @@ def parse_linked_files(
     lnk2_data_abs_start: int = 0,
     lnk2_length_field_abs: int = 0,
 ) -> LinkedFiles:
-    """Parse the payload of an lnk2 (or lnkE) tagged block."""
     log.debug(
         "Parsing lnk2 payload: %d bytes (abs_start=%d)",
         len(lnk2_data),
@@ -110,26 +115,23 @@ def parse_linked_files(
         lnk2_data_length=len(lnk2_data),
     )
 
-    # Walk by searching for 'liFD' markers (most reliable across padding)
     search_from = 0
     while True:
         marker = lnk2_data.find(b"liFD", search_from)
         if marker < 0:
             break
-        item_start = marker - 8  # size field is 8 bytes before type
+        item_start = marker - 8
         if item_start < 0:
             search_from = marker + 4
             continue
 
         declared_size = struct.unpack(">Q", lnk2_data[item_start : item_start + 8])[0]
-        # Actual span to next item (or end) — includes alignment padding
         next_marker = lnk2_data.find(b"liFD", marker + 4)
         if next_marker > 0:
             actual_span = (next_marker - 8) - item_start
         else:
             actual_span = len(lnk2_data) - item_start
 
-        # Read the full span so we keep padding when rewriting
         span = min(actual_span, len(lnk2_data) - item_start)
         item_bytes = lnk2_data[item_start : item_start + span]
 
@@ -158,7 +160,6 @@ def parse_linked_files(
 def _parse_single_item(
     item: bytes, item_offset: int = 0, actual_span: int = 0
 ) -> Optional[LinkedFile]:
-    """Parse one liFD record."""
     if len(item) < 32:
         return None
 
@@ -166,19 +167,12 @@ def _parse_single_item(
     typ = item[8:12]
     if typ != b"liFD":
         return None
-    ver = struct.unpack(">I", item[12:16])[0]
 
-    # Unique ID — ASCII starting with '$' until a non-printable byte
     p = 16
     while p < len(item) and 32 <= item[p] < 127:
         p += 1
     uuid = item[16:p].decode("ascii", errors="replace")
-    if not uuid.startswith("$"):
-        log.debug(
-            "Unexpected UUID format at item offset %d: %r", item_offset, uuid[:40]
-        )
 
-    # Filename — u32 character count + UTF-16BE
     if p + 4 > len(item):
         return None
     fname_chars = struct.unpack(">I", item[p : p + 4])[0]
@@ -199,7 +193,6 @@ def _parse_single_item(
     datasize = struct.unpack(">Q", item[p + 8 : p + 16])[0]
     p += 16
 
-    # Locate the real file payload by magic bytes
     magic_offset = -1
     for magic in (b"8BPS", b"\x89PNG", b"\xff\xd8\xff", b"GIF8"):
         mi = item.find(magic, p)
@@ -213,7 +206,6 @@ def _parse_single_item(
         )
         return None
 
-    # Clamp datasize to available bytes
     available = len(item) - magic_offset
     if datasize > available:
         log.debug(
@@ -237,24 +229,22 @@ def _parse_single_item(
         item_size=declared_size,
         actual_span=actual_span or len(item),
         file_offset_in_item=magic_offset,
-        raw_item=item,  # full span including padding
+        raw_item=item,
     )
 
 
 # ---------------------------------------------------------------------------
-# High-level helpers used by the Mockup API
+# High-level helpers
 # ---------------------------------------------------------------------------
 
 
 def load_linked_files_from_document(doc) -> LinkedFiles:
-    """Extract and parse the lnk2 block from an already-opened PSDDocument."""
     block = doc.layer_mask.linked_layers_block()
     if block is None:
         log.error("No lnk2/lnkE block found in document")
         return LinkedFiles()
 
     raw = doc._raw
-    # Search for the lnk2 signature in the whole file (reliable)
     sig = b"8BIMlnk2"
     abs_sig = raw.find(sig)
     if abs_sig < 0:
@@ -264,7 +254,6 @@ def load_linked_files_from_document(doc) -> LinkedFiles:
         log.error("Could not locate lnk2/lnkE signature in raw PSD")
         return LinkedFiles()
 
-    # After signature (8) comes 4-byte length
     length_field_abs = abs_sig + 8
     data_len = struct.unpack(">I", raw[length_field_abs : length_field_abs + 4])[0]
     data_abs_start = length_field_abs + 4
@@ -284,12 +273,13 @@ def load_linked_files_from_document(doc) -> LinkedFiles:
     )
 
 
-def image_to_minimal_psd(image_path: str | Path) -> bytes:
-    """Load an image and wrap it as a minimal valid RGB PSD (version 1).
+def image_to_embed_bytes(image_path: str | Path) -> bytes:
+    """Load an image, optionally downscale, and return PNG bytes for embedding.
 
-    Photopea / Photoshop expect the linked smart-object content to be a
-    real PSD/PSB document, not a raw PNG.  This builds the smallest valid
-    PSD that carries the design as flattened image data (raw compression).
+    PNG is used because:
+    - This mockup already contains a PNG linked file (accepted by Photopea)
+    - A full-res 4800x7500 raw PSD is ~108MB and Photopea often marks it damaged
+    - PNG stays small and valid
     """
     from PIL import Image
 
@@ -298,49 +288,42 @@ def image_to_minimal_psd(image_path: str | Path) -> bytes:
     img = Image.open(path)
     log.debug("Image mode=%s size=%s", img.mode, img.size)
 
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-        log.debug("Converted to RGB")
-
+    # Auto-resize large designs (mockup slots are typically a few hundred px)
     w, h = img.size
-    pixels = img.tobytes()  # RGBRGBRGB...
+    long_edge = max(w, h)
+    if long_edge > MAX_DESIGN_EDGE:
+        scale = MAX_DESIGN_EDGE / long_edge
+        new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+        log.info(
+            "Resizing design %dx%d -> %dx%d (max edge %d)",
+            w,
+            h,
+            new_size[0],
+            new_size[1],
+            MAX_DESIGN_EDGE,
+        )
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
 
-    # Planar channels (R plane, then G, then B)
-    r_plane = bytes(pixels[i] for i in range(0, len(pixels), 3))
-    g_plane = bytes(pixels[i] for i in range(1, len(pixels), 3))
-    b_plane = bytes(pixels[i] for i in range(2, len(pixels), 3))
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGBA")
+        log.debug("Converted to RGBA")
 
-    # Image Data section: compression 0 (raw) + planar data
-    image_data_section = struct.pack(">H", 0) + r_plane + g_plane + b_plane
-
-    # Empty sections
-    color_mode = struct.pack(">I", 0)
-    image_resources = struct.pack(">I", 0)
-    layer_mask = struct.pack(">I", 0)
-
-    # 26-byte File Header
-    header = (
-        b"8BPS"
-        + struct.pack(">H", 1)  # version = PSD
-        + b"\x00" * 6  # reserved
-        + struct.pack(">H", 3)  # channels
-        + struct.pack(">I", h)  # height
-        + struct.pack(">I", w)  # width
-        + struct.pack(">H", 8)  # depth
-        + struct.pack(">H", 3)  # RGB
-    )
-
-    psd = header + color_mode + image_resources + layer_mask + image_data_section
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    data = buf.getvalue()
     log.info(
-        "Built minimal PSD: %d bytes (%dx%d RGB)", len(psd), w, h
+        "Embed PNG: %d bytes (%dx%d)", len(data), img.width, img.height
     )
-    return psd
+    return data
 
 
-# Keep old name as alias so existing call sites still work
+# Backwards-compatible aliases
+def image_to_minimal_psd(image_path: str | Path) -> bytes:
+    return image_to_embed_bytes(image_path)
+
+
 def image_to_png_bytes(image_path: str | Path) -> bytes:
-    """Deprecated alias — prefer image_to_minimal_psd."""
-    return image_to_minimal_psd(image_path)
+    return image_to_embed_bytes(image_path)
 
 
 def replace_linked_file_data(
@@ -350,13 +333,9 @@ def replace_linked_file_data(
     new_file_data: bytes,
     new_filename: str | None = None,
 ) -> bytes:
-    """Return a new PSD byte string with the target linked file's payload replaced.
+    """Splice new_file_data into the target linked-file slot.
 
-    Critical details for Photopea / Photoshop compatibility:
-    - The liFD size field stores the length of data *after* itself (excludes the 8 bytes).
-    - We keep the original UUID so layer references still resolve.
-    - We set filetype to b'8BPS' because the payload is a version-1 PSD.
-    - We use actual_span (including padding) when removing the old item.
+    Size field rule: value = len(data after the u64), does NOT include itself.
     """
     log.info(
         "Replacing linked file %r (uuid=%s) old_size=%d -> new_size=%d",
@@ -366,41 +345,42 @@ def replace_linked_file_data(
         len(new_file_data),
     )
 
-    # --- rebuild the single item -----------------------------------------
     old_item = target.raw_item
-    # Everything before the embedded file magic (UUID, name, descriptors…)
     header = bytearray(old_item[: target.file_offset_in_item])
 
-    # Locate datasize + filetype inside the header
+    # Locate filetype + datasize inside header
     p = 16
     while p < len(header) and 32 <= header[p] < 127:
         p += 1
     fname_chars = struct.unpack(">I", header[p : p + 4])[0]
     p += 4 + fname_chars * 2
-    # p = filetype (4) | creator (4) | datasize (8)
     filetype_off = p
     datasize_off = p + 8
 
-    # Mark as regular PSD content
-    header[filetype_off : filetype_off + 4] = b"8BPS"
+    # Match existing PNG linked file style in this mockup (type 'png ')
+    if new_file_data[:4] == b"\x89PNG":
+        header[filetype_off : filetype_off + 4] = b"png "
+    elif new_file_data[:4] == b"8BPS":
+        header[filetype_off : filetype_off + 4] = b"8BPS"
+    else:
+        header[filetype_off : filetype_off + 4] = b"    "
+
     struct.pack_into(">Q", header, datasize_off, len(new_file_data))
     log.debug(
-        "Patched filetype=8BPS, datasize=%d at item offsets %d / %d",
+        "Patched filetype=%r, datasize=%d",
+        bytes(header[filetype_off : filetype_off + 4]),
         len(new_file_data),
-        filetype_off,
-        datasize_off,
     )
 
-    # Body after the leading size field
     body_after_size = bytes(header[8:]) + new_file_data
 
-    # Align total item length to 4 bytes (Adobe convention)
+    # 4-byte align total item
     total_len = 8 + len(body_after_size)
     pad = (4 - (total_len % 4)) % 4
     if pad:
         body_after_size += b"\x00" * pad
 
-    # Size field = length of everything AFTER it (does NOT include itself)
+    # Size EXCLUDES the 8-byte size field itself
     size_field_value = len(body_after_size)
     new_item = struct.pack(">Q", size_field_value) + body_after_size
 
@@ -413,16 +393,13 @@ def replace_linked_file_data(
         target.actual_span,
     )
 
-    # --- splice into lnk2 payload ----------------------------------------
     lnk2_payload = raw_psd[
         linked_files.lnk2_data_abs_start : linked_files.lnk2_data_abs_start
         + linked_files.lnk2_data_length
     ]
 
-    # Use actual_span so we correctly skip old padding between items
     old_span = target.actual_span
     if old_span <= 0:
-        # Fallback: distance to next item
         next_off = None
         for f in linked_files.files:
             if f.item_offset > target.item_offset:
@@ -449,22 +426,18 @@ def replace_linked_file_data(
     size_delta = len(new_payload) - linked_files.lnk2_data_length
     log.info("lnk2 payload size delta: %+d bytes", size_delta)
 
-    # Sanity: every original UUID must still be findable
     for f in linked_files.files:
         if f.uuid.encode("ascii") not in new_payload:
-            log.error("UUID %s missing after splice — structure is broken", f.uuid)
+            log.error("UUID %s missing after splice", f.uuid)
             raise RuntimeError(
                 f"Linked-file splice lost UUID {f.uuid}. "
                 "This would cause 'unknown linked layer' in Photopea."
             )
 
-    # --- rebuild the full PSD --------------------------------------------
     raw = bytearray(raw_psd)
 
-    # 1. Update the 4-byte lnk2 length field
     struct.pack_into(">I", raw, linked_files.lnk2_length_field_abs, len(new_payload))
 
-    # 2. Update LayerAndMask section length
     r = BinaryReader(raw_psd)
     r.seek(26)
     cmd_len = r.read_u32()
@@ -482,7 +455,6 @@ def replace_linked_file_data(
     )
     struct.pack_into(">I", raw, lm_length_field_abs, new_lm_len)
 
-    # 3. Splice payload
     before = bytes(raw[: linked_files.lnk2_data_abs_start])
     after = bytes(
         raw[linked_files.lnk2_data_abs_start + linked_files.lnk2_data_length :]
