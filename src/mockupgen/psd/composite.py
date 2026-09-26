@@ -272,38 +272,6 @@ def _decode_embedded_psd_image(data: bytes) -> Image.Image:
     raise NotImplementedError(f"embedded channels {channels}")
 
 
-def _clear_region_to_shirt(
-    base: Image.Image,
-    polygon: list[tuple[int, int]],
-    shirt_source: Image.Image,
-) -> Image.Image:
-    """Replace the placement region with shirt fabric.
-
-    Uses a high-pass of the original composite so large-scale design
-    colour is removed while fine fabric folds remain. Transparent
-    pixels of the replacement design then reveal this shirt, not a
-    flat white card or the old artwork.
-    """
-    if not polygon:
-        return base
-
-    w, h = base.size
-    mask = Image.new("L", (w, h), 0)
-    ImageDraw.Draw(mask).polygon(polygon, fill=255)
-
-    src = shirt_source.convert("RGB")
-    gray = src.convert("L")
-    blur = gray.filter(ImageFilter.GaussianBlur(radius=20))
-    detail = ImageChops.subtract(gray, blur, scale=1.0, offset=128)
-    # Base shirt ~245 with folds from detail
-    shirt_l = detail.point(lambda x: max(0, min(255, x + 117)))
-    shirt_rgb = Image.merge("RGB", (shirt_l, shirt_l, shirt_l))
-    shirt_rgba = shirt_rgb.convert("RGBA")
-    shirt_rgba.putalpha(mask)
-
-    return Image.alpha_composite(base.convert("RGBA"), shirt_rgba)
-
-
 def composite_document(
     doc: PSDDocument,
     *,
@@ -314,18 +282,17 @@ def composite_document(
     """Build an exported RGB image of the document.
 
     Uses bezier mesh warp when PlLd has customEnvelopeWarp mesh points.
-    Transparent design pixels reveal reconstructed shirt fabric underneath.
+    Transparent design pixels leave the original composite visible (real shirt).
     """
     overrides = overrides or {}
     base_rgb = decode_image_data(doc)
     canvas_size = (doc.width, doc.height)
-    source_for_shirt = (
-        original_composite.convert("RGBA")
-        if original_composite is not None
-        else base_rgb.convert("RGBA")
-    )
 
-    result = base_rgb.convert("RGBA")
+    # Prefer pre-replace composite so we keep the real shirt under transparency
+    if original_composite is not None:
+        result = original_composite.convert("RGBA")
+    else:
+        result = base_rgb.convert("RGBA")
 
     for layer in doc.layers():
         if not layer.is_smart_object:
@@ -348,20 +315,12 @@ def composite_document(
         )
 
         if transform.has_mesh_warp:
-            poly = _mesh_boundary_polygon(transform.mesh_points)  # type: ignore
             warped = warp_to_mesh(img, transform.mesh_points, canvas_size)  # type: ignore
         else:
-            poly = [
-                (int(transform.corners[0][0]), int(transform.corners[0][1])),
-                (int(transform.corners[1][0]), int(transform.corners[1][1])),
-                (int(transform.corners[2][0]), int(transform.corners[2][1])),
-                (int(transform.corners[3][0]), int(transform.corners[3][1])),
-            ]
             warped = warp_to_quad(img, transform.corners, canvas_size)
 
-        # Clear old design so transparent pixels show shirt, not old artwork
-        result = _clear_region_to_shirt(result, poly, source_for_shirt)
-
+        # Only paint where the design has alpha. Transparent pixels leave
+        # the original composite (real shirt) visible — no white card.
         if layer.opacity < 255:
             a = warped.split()[3].point(lambda p: p * layer.opacity // 255)
             warped.putalpha(a)
