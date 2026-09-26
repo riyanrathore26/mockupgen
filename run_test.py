@@ -1,4 +1,5 @@
 from mockupgen import Mockup, setup_logging
+from pathlib import Path
 
 # Show detailed logs (helpful for beginners)
 setup_logging("DEBUG")
@@ -13,8 +14,8 @@ print("Smart objects:", m.list_smart_objects())
 # 3. Replace the "front" smart object with your design
 m.replace_smart_object("front", "tests/small.png")
 
-# 4. Save the result
-m.save("tests/output.psd")
+# 4. Export full composite (warps + blend) — no output.psd
+out = Path("tests/exported.png")
+m.export(out)
 
-print("Done! Open tests/output.psd in Photoshop.")
-
+print(f"Done! Exported composite → {out}")
