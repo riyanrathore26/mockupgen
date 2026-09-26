@@ -21,6 +21,8 @@ class Mockup:
         self._raw = bytearray(document._raw)
         self._linked: Optional[so_mod.LinkedFiles] = None
         self._dirty = False
+        # name -> path of last replacement image (for export without re-reading PSD)
+        self._replacements: dict[str, Path] = {}
         log.debug("Mockup created: %s", self)
 
     @classmethod
@@ -95,7 +97,7 @@ class Mockup:
         """Replace smart-object content with the given image (PNG embed).
 
         Large images are auto-resized so Photopea does not report the file
-        as damaged. Call :meth:`save` afterwards.
+        as damaged. Call :meth:`save` and/or :meth:`export` afterwards.
         """
         layer, linked_file = self._resolve(name)
         log.info(
@@ -105,6 +107,7 @@ class Mockup:
             linked_file.filename,
         )
 
+        image_path = Path(image_path)
         new_data = so_mod.image_to_embed_bytes(image_path)
 
         new_raw = so_mod.replace_linked_file_data(
@@ -116,7 +119,8 @@ class Mockup:
         self._raw = bytearray(new_raw)
         self._dirty = True
         self._linked = None
-        log.info("Replacement done — call save() to write the file")
+        self._replacements[name] = image_path
+        log.info("Replacement done — call save() and/or export()")
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
@@ -127,11 +131,66 @@ class Mockup:
         log.info("Saved successfully")
         self._dirty = False
 
-    def export(self, path: str | Path) -> None:
-        raise NotImplementedError(
-            "export() / compositing is Phase 5. "
-            "After replace + save, open the PSD in Photopea or Photoshop."
-        )
+    def export(self, path: str | Path) -> Path:
+        """Full composite export (warps + normal blend).
+
+        Decodes the flattened document composite, then perspective-warps
+        every replaced smart-object design onto its PlLd corners and
+        alpha-composites them. Writes a PNG (or JPEG if path ends with
+        .jpg/.jpeg) and returns the output path.
+
+        This is Phase 5 v1: normal blend mode and 4-corner perspective
+        only (no mesh warp, no advanced blend modes yet).
+        """
+        from PIL import Image
+        from mockupgen.psd.composite import composite_document, linked_file_to_image
+        from mockupgen.psd.document import PSDDocument
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        log.info("export() → %s", path)
+
+        # Re-parse the (possibly modified) PSD bytes so layer UUIDs still match
+        doc = PSDDocument.open(bytes(self._raw))
+
+        overrides: dict[str, Image.Image] = {}
+
+        # Prefer in-memory replacement paths tracked by replace_smart_object
+        for name, img_path in self._replacements.items():
+            log.debug("Loading override for %r from %s", name, img_path)
+            overrides[name] = Image.open(img_path).convert("RGBA")
+
+        # Also try linked files that are already raster (PNG/JPEG) so
+        # non-replaced smart objects can be re-composited if desired.
+        if not overrides:
+            linked = self._ensure_linked()
+            for layer in doc.smart_objects():
+                uuid = layer.placed_layer_uuid()
+                lf = None
+                if uuid:
+                    lf = linked.find_by_uuid(uuid)
+                if lf is None:
+                    lf = linked.find_by_filename(layer.display_name)
+                if lf is None:
+                    continue
+                img = linked_file_to_image(lf.file_data)
+                if img is not None:
+                    overrides[layer.display_name] = img
+
+        result = composite_document(doc, overrides=overrides)
+
+        suffix = path.suffix.lower()
+        if suffix in (".jpg", ".jpeg"):
+            result = result.convert("RGB")
+            result.save(path, quality=95)
+        else:
+            if suffix != ".png":
+                path = path.with_suffix(".png")
+            result.save(path)
+
+        log.info("Exported %s (%dx%d)", path, result.width, result.height)
+        return path
 
     def _ensure_linked(self) -> so_mod.LinkedFiles:
         if self._linked is None:
