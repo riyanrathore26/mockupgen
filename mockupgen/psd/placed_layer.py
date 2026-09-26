@@ -228,7 +228,7 @@ def _parse_mesh_points(data: bytes, start: int) -> Optional[list[tuple[float, fl
             return None
         return list(zip(xs, ys))
     except Exception as exc:
-        log.debug("mesh parse failed: %s", exp)
+        log.debug("mesh parse failed: %s", exc)
         return None
 
 
