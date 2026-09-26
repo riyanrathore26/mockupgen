@@ -212,7 +212,7 @@ def linked_file_to_image(file_data: bytes) -> Optional[Image.Image]:
         try:
             return _decode_embedded_psd_image(file_data)
         except Exception as exc:
-            log.warning("Could not decode embedded PSD/PSB: %s", exp)
+            log.warning("Could not decode embedded PSD/PSB: %s", exc)
             return None
     return None
 
