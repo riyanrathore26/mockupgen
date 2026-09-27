@@ -99,45 +99,35 @@ def linked_file_dimensions(lf: "LinkedFile") -> tuple[int, int] | None:
 
 
 def prepare_design_on_canvas(
-    image_path: str | Path,
+    image_path,
     canvas_w: int,
     canvas_h: int,
     *,
     fill: float = 1.0,
     top_bias: float = 0.5,
-) -> "object":
-    """Place design on a transparent canvas matching the smart-object size.
+):
+    """Stretch the design to exactly fill the smart object's native canvas.
 
-    Fits the design into the SO canvas at the given fill ratio (default 1.0 =
-    actual size, full canvas). Keeps aspect ratio and transparency. top_bias
-    0.5 = vertically centered.
+    No aspect-ratio preservation — the texture is resized to (canvas_w, canvas_h)
+    directly, so every pixel of the SO panel is covered.
+
+    `fill` and `top_bias` are accepted for API compatibility but ignored.
     """
     from PIL import Image
 
-    img = Image.open(image_path).convert("RGBA")
-    iw, ih = img.size
-    if iw < 1 or ih < 1:
-        return Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    design = Image.open(image_path).convert("RGBA")
 
-    fill = max(0.1, min(1.0, float(fill)))
-    max_w = canvas_w * fill
-    max_h = canvas_h * fill
-    scale = min(max_w / iw, max_h / ih)
-    nw = max(1, round(iw * scale))
-    nh = max(1, round(ih * scale))
-    if (nw, nh) != (iw, ih):
-        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+    if (design.width, design.height) != (canvas_w, canvas_h):
+        design = design.resize(
+            (canvas_w, canvas_h),
+            Image.Resampling.LANCZOS,
+        )
 
-    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
-    ox = (canvas_w - nw) // 2
-    free_y = max(0, canvas_h - nh)
-    oy = int(free_y * max(0.0, min(1.0, top_bias)))
-    canvas.paste(img, (ox, oy), img)
-    log.info(
-        "Prepared design %dx%d -> canvas %dx%d (placed %dx%d at %d,%d, fill=%.2f)",
-        iw, ih, canvas_w, canvas_h, nw, nh, ox, oy, fill,
-    )
-    return canvas
+    # Ensure canvas-sized output even if resize produced 1-off dims
+    if design.size != (canvas_w, canvas_h):
+        design = design.resize((canvas_w, canvas_h), Image.Resampling.LANCZOS)
+
+    return design
 
 
 def parse_linked_files(

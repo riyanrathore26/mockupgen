@@ -155,6 +155,7 @@ class Mockup:
         self._replacements[name] = embed_path
         log.info("Replacement done — call save() and/or export()")
 
+
     def save(self, path: str | Path) -> None:
         path = Path(path)
         log.info(
@@ -273,3 +274,59 @@ class Mockup:
     def __repr__(self) -> str:
         so = self.list_smart_objects()
         return f"<Mockup {self.width}x{self.height} smart_objects={so} dirty={self._dirty}>"
+
+    def is_clipped(self, name: str) -> bool:
+        layer = self._doc.find_layer(name)
+        if layer is None:
+            raise KeyError(name)
+        # Attribute name may differ — check layer_mask.py
+        return bool(getattr(layer, "clipping", 0))
+
+    def clip_base_layer(self, name: str) -> Optional[str]:
+        """Return the name of the layer this layer is clipped to, or    None."""
+        layers = self._doc.layers()
+        idx = next((i for i, L in enumerate(layers) if L.display_name   == name), None)
+        if idx is None:
+            raise KeyError(name)
+        if not getattr(layers[idx], "clipping", 0):
+            return None
+        for L in reversed(layers[:idx]):
+            if not getattr(L, "clipping", 0):
+                return L.display_name
+        return None
+
+    def layer_position(self, name: str) -> dict:
+        """Return the on-canvas position of a smart object.
+    
+        Smart objects usually have zero layer bounds; the real  placement is in the
+        PlLd transform. Returns a dict with:
+          - 'layer_rect': (left, top, right, bottom) from LayerRecord
+          - 'corners':    [(x, y), ...]  four PlLd corners in   document coords
+          - 'center':     (cx, cy) center of the corners
+          - 'bbox':       (x0, y0, x1, y1) axis-aligned bounding box    of the corners
+        """
+        from mockupgen.psd.placed_layer import get_placed_transform
+    
+        layer = self._doc.find_layer(name)
+        if layer is None:
+            raise KeyError(name)
+    
+        info = {
+            "layer_rect": (layer.left, layer.top, layer.right, layer.   bottom),
+            "corners": None,
+            "center": None,
+            "bbox": None,
+        }
+    
+        transform = get_placed_transform(layer)
+        if transform is None:
+            return info
+    
+        corners = list(transform.corners)          # [(x0,y0), (x1, y1), (x2,y2), (x3,y3)]
+        info["corners"] = corners
+    
+        xs = [p[0] for p in corners]
+        ys = [p[1] for p in corners]
+        info["bbox"] = (min(xs), min(ys), max(xs), max(ys))
+        info["center"] = (sum(xs) / 4.0, sum(ys) / 4.0)
+        return info

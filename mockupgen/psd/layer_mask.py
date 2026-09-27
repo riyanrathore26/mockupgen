@@ -167,6 +167,38 @@ class LayerAndMaskInfo:
                 return b
         return None
 
+    def layer_channel_bytes(self, target: LayerRecord) -> dict[int, tuple[bytes, int]]:
+        """Return {channel_id: (body_bytes_without_compression_field, compression)} for one layer.
+
+        The channel image data blob stores each layer's channels concatenated in
+        the same order as they appear in `layer.channels`.  Each channel is:
+
+            [2-byte compression][data_length - 2 bytes of image data]
+
+        `ChannelInfo.data_length` INCLUDES the 2-byte compression field.
+
+        Returns an empty dict if the target layer is not found or the blob is
+        truncated.
+        """
+        data = self.channel_image_data
+        offset = 0
+        for L in self.layers:
+            is_target = (L is target)
+            result: dict[int, tuple[bytes, int]] = {}
+            for ch in L.channels:
+                if offset + 2 > len(data):
+                    return result if is_target else {}
+                compression = int.from_bytes(data[offset:offset + 2], "big")
+                body = data[offset + 2 : offset + ch.data_length]
+                if is_target:
+                    result[ch.channel_id] = (body, compression)
+                offset += ch.data_length
+                if offset > len(data):
+                    return result if is_target else {}
+            if is_target:
+                return result
+        return {}
+
     # ------------------------------------------------------------------
     # Parsing
     # ------------------------------------------------------------------
