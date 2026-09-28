@@ -65,7 +65,6 @@ def _decode_rle_planes(data: bytes, w: int, h: int, channels: int) -> list[bytes
 
 
 def _decode_rle_channel(data: bytes, w: int, h: int) -> bytes:
-    """Decode a per-layer RLE channel: h rows, preceded by an h*2-byte row-length table."""
     if len(data) < h * 2:
         return b""
     lengths = struct.unpack(">" + "H" * h, data[: h * 2])
@@ -257,20 +256,19 @@ def _decode_embedded_psd_image(data: bytes) -> Image.Image:
 def _apply_fabric_shading(
     warped: Image.Image,
     original_composite: Image.Image,
-    strength: float = 0.35,
+    strength: float = 0.45,
 ) -> Image.Image:
-    """Soft fabric folds from original composite high-pass."""
+    """Multiply design by shirt high-pass so folds darken/brighten the print."""
     if strength <= 0:
         return warped
-    shirt_source = original_composite
     w, h = warped.size
-    gray = shirt_source.convert("L").resize((w, h), Image.Resampling.BILINEAR)
-    blur = gray.filter(ImageFilter.GaussianBlur(radius=18))
+    gray = original_composite.convert("L").resize((w, h), Image.Resampling.BILINEAR)
+    blur = gray.filter(ImageFilter.GaussianBlur(radius=14))
     detail = ImageChops.subtract(gray, blur, scale=1.0, offset=128)
 
     def map_factor(d: int) -> int:
         f = 1.0 + strength * (d - 128) / 128.0
-        f = max(0.7, min(1.25, f))
+        f = max(0.55, min(1.35, f))
         return int(round(f * 128))
 
     factor_l = detail.point(map_factor)
@@ -285,7 +283,6 @@ def _apply_fabric_shading(
 
 
 def _layer_base_alpha(doc: PSDDocument, layer, canvas_size) -> Optional[object]:
-    """Return the base LayerRecord that `layer` is clipped to, or None."""
     layers = doc.layers()
     try:
         idx = layers.index(layer)
@@ -302,7 +299,6 @@ def _layer_base_alpha(doc: PSDDocument, layer, canvas_size) -> Optional[object]:
 def _render_layer_alpha(
     doc: PSDDocument, layer, canvas_size: tuple[int, int]
 ) -> Optional[Image.Image]:
-    """Build an L-mode mask from the layer's transparency channel (-1)."""
     w, h = canvas_size
     lw, lh = layer.width, layer.height
     if lw == 0 or lh == 0:
@@ -362,16 +358,10 @@ def composite_document(
     *,
     overrides: Optional[dict[str, Image.Image]] = None,
     original_composite: Optional[Image.Image] = None,
-    fabric_strength: float = 0.35,
+    fabric_strength: float = 0.45,
     original_linked: Optional[dict[str, bytes]] = None,
 ) -> Image.Image:
-    """Build an exported RGB image of the document.
-
-    - Warps with mesh (if present) or 4-corner perspective.
-    - Clips silhouette to PlLd corners so design cannot spill under the arm.
-    - Clips to base layer alpha when the SO is a clipping child (PSD clipping).
-    - Optional fabric shading / fold occlusion.
-    """
+    """Build an exported RGB image of the document."""
     overrides = overrides or {}
     original_linked = original_linked or {}
     base_rgb = decode_image_data(doc)
@@ -420,22 +410,22 @@ def composite_document(
         )
         warped = _warp(img, local_size)
 
-        # Clip silhouette to the 4 PlLd corners (the intended print footprint).
-        # Mesh still warps the interior for fabric shape; corners define the edge.
+        # Soft clip to PlLd corners: keeps design on the print footprint
+        # without a hard sticker edge. Mesh already shaped the interior.
         try:
             outline = list(transform.corners)
             poly_mask = Image.new("L", canvas_size, 0)
             ImageDraw.Draw(poly_mask).polygon(
                 [(float(x), float(y)) for x, y in outline], fill=255
             )
-            poly_mask = poly_mask.filter(ImageFilter.GaussianBlur(radius=0.5))
-            poly_mask = poly_mask.point(lambda v: 255 if v > 128 else 0)
+            # Feather edge ~3px so it blends into fabric instead of a hard cut
+            poly_mask = poly_mask.filter(ImageFilter.GaussianBlur(radius=2.0))
             a = warped.split()[3]
             warped.putalpha(ImageChops.multiply(a, poly_mask))
         except Exception as exc:
             log.debug("Outline clip failed for %r: %s", name, exc)
 
-        # --- 1. Punch a hole: remove the old design from the base ---
+        # --- 1. Punch hole for old design ---
         orig_data = original_linked.get(name)
         orig_warped = None
         if orig_data is not None:
@@ -458,7 +448,7 @@ def composite_document(
                 log.debug("Could not punch hole for %r: %s", name, exc)
                 orig_warped = None
 
-        # --- 2. Clip new design to original SO visibility ---
+        # --- 2. Original SO alpha ---
         if orig_warped is not None:
             try:
                 _, _, _, new_a = warped.split()
@@ -470,7 +460,7 @@ def composite_document(
             except Exception as exc:
                 log.debug("Could not apply original mask for %r: %s", name, exc)
 
-        # --- 3. Clip to base layer's transparency (PSD clipping) ---
+        # --- 3. PSD clipping to base layer ---
         base_layer = _layer_base_alpha(doc, layer, canvas_size)
         if base_layer is not None:
             base_alpha = _render_layer_alpha(doc, base_layer, canvas_size)
@@ -501,9 +491,12 @@ def composite_document(
                 detail = ImageChops.subtract(gray, blur, scale=1.0, offset=128)
 
                 def fold_alpha(d: int) -> int:
-                    if d >= 128:
+                    # Dark folds hide the print (matches Photopea fabric occlusion)
+                    if d >= 140:
                         return 255
-                    return max(100, int(140 + (d / 128.0) * 115))
+                    if d <= 90:
+                        return 70
+                    return int(70 + (d - 90) / 50.0 * 185)
 
                 fold_mod = detail.point(fold_alpha)
                 _, _, _, a = warped.split()
