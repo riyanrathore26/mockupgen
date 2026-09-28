@@ -113,6 +113,88 @@ def warp_to_quad(
     )
 
 
+MESH_GRID = 16
+
+
+def _bernstein3(i: int, t: float) -> float:
+    return [1, 3, 3, 1][i] * (t ** i) * ((1 - t) ** (3 - i))
+
+
+def _bezier_surface(u: float, v: float, pts: list) -> tuple[float, float]:
+    x = y = 0.0
+    for j in range(4):
+        for i in range(4):
+            b = _bernstein3(i, u) * _bernstein3(j, v)
+            px, py = pts[j * 4 + i]
+            x += b * px
+            y += b * py
+    return x, y
+
+
+def warp_to_mesh(
+    src: Image.Image,
+    mesh: list,
+    canvas_size: tuple[int, int],
+    grid: int = MESH_GRID,
+) -> Image.Image:
+    """Warp src through a 4x4 Bezier envelope mesh into document space."""
+    if src.mode != "RGBA":
+        src = src.convert("RGBA")
+    cw, ch = canvas_size
+    out = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+    sw, sh = src.size
+
+    grid_pts = []
+    for j in range(grid + 1):
+        v = j / grid
+        grid_pts.append([_bezier_surface(i / grid, v, mesh) for i in range(grid + 1)])
+
+    for j in range(grid):
+        for i in range(grid):
+            u0, u1 = i / grid, (i + 1) / grid
+            v0, v1 = j / grid, (j + 1) / grid
+            sx0, sx1 = u0 * sw, u1 * sw
+            sy0, sy1 = v0 * sh, v1 * sh
+            cell = src.crop((
+                int(sx0), int(sy0),
+                max(int(sx1), int(sx0) + 1),
+                max(int(sy1), int(sy0) + 1),
+            ))
+            if cell.size[0] < 1 or cell.size[1] < 1:
+                continue
+            cw_cell, ch_cell = cell.size
+            src_corners = [
+                (0.0, 0.0), (float(cw_cell), 0.0),
+                (float(cw_cell), float(ch_cell)), (0.0, float(ch_cell)),
+            ]
+            dst_corners = [
+                grid_pts[j][i], grid_pts[j][i + 1],
+                grid_pts[j + 1][i + 1], grid_pts[j + 1][i],
+            ]
+            xs = [p[0] for p in dst_corners]
+            ys = [p[1] for p in dst_corners]
+            bx0 = max(0, int(min(xs)) - 1)
+            by0 = max(0, int(min(ys)) - 1)
+            bx1 = min(cw, int(max(xs)) + 2)
+            by1 = min(ch, int(max(ys)) + 2)
+            if bx1 <= bx0 or by1 <= by0:
+                continue
+            local_dst = [(x - bx0, y - by0) for x, y in dst_corners]
+            try:
+                local_coeffs = _find_perspective_coeffs(list(local_dst), src_corners)
+            except ValueError:
+                continue
+            piece = cell.transform(
+                (bx1 - bx0, by1 - by0),
+                Image.Transform.PERSPECTIVE,
+                local_coeffs,
+                resample=Image.Resampling.BILINEAR,
+                fillcolor=(0, 0, 0, 0),
+            )
+            out.paste(piece, (bx0, by0), piece)
+    return out
+
+
 def linked_file_to_image(file_data: bytes) -> Optional[Image.Image]:
     if not file_data:
         return None
@@ -202,16 +284,8 @@ def _apply_fabric_shading(
     return shaded
 
 
-# ---------------------------------------------------------------------------
-# Clipping support
-# ---------------------------------------------------------------------------
-
 def _layer_base_alpha(doc: PSDDocument, layer, canvas_size) -> Optional[object]:
-    """Return the base LayerRecord that `layer` is clipped to, or None.
-
-    PSD semantics: a layer with clipping=1 clips to the nearest preceding
-    layer with clipping=0 (positional, not referential).
-    """
+    """Return the base LayerRecord that `layer` is clipped to, or None."""
     layers = doc.layers()
     try:
         idx = layers.index(layer)
@@ -228,17 +302,12 @@ def _layer_base_alpha(doc: PSDDocument, layer, canvas_size) -> Optional[object]:
 def _render_layer_alpha(
     doc: PSDDocument, layer, canvas_size: tuple[int, int]
 ) -> Optional[Image.Image]:
-    """Build an L-mode mask from the layer's transparency channel (-1).
-
-    Falls back to a bounding-rectangle mask if the layer has no transparency
-    channel (fully-opaque layer case).
-    """
+    """Build an L-mode mask from the layer's transparency channel (-1)."""
     w, h = canvas_size
     lw, lh = layer.width, layer.height
     if lw == 0 or lh == 0:
         return None
 
-    # Find the LayerAndMaskInfo on the document.  Try common attribute names.
     lam = (
         getattr(doc, "layer_and_mask", None)
         or getattr(doc, "layer_mask", None)
@@ -250,7 +319,6 @@ def _render_layer_alpha(
 
     chan = lam.layer_channel_bytes(layer)
     if -1 not in chan:
-        # No transparency channel → treat the layer as opaque inside its rect.
         log.warning(
             "Layer %r has no transparency channel — using rect mask",
             layer.display_name,
@@ -289,10 +357,6 @@ def _render_layer_alpha(
     return mask
 
 
-# ---------------------------------------------------------------------------
-# Main composite
-# ---------------------------------------------------------------------------
-
 def composite_document(
     doc: PSDDocument,
     *,
@@ -303,12 +367,10 @@ def composite_document(
 ) -> Image.Image:
     """Build an exported RGB image of the document.
 
-    - Warps the new design with the PlLd four-corner perspective transform.
-    - Erases the original design from the base (punch-hole) so nothing double-prints.
-    - Multiplies the new design alpha by the original SO alpha (inherits author clipping).
-    - Multiplies the new design alpha by the base layer's transparency channel
-      when the SO layer is clipped (clipping == 1).
-    - Uses fabric high-pass both for shading and to further hide the design in deep folds.
+    - Warps with mesh (if present) or 4-corner perspective.
+    - Clips silhouette to PlLd corners so design cannot spill under the arm.
+    - Clips to base layer alpha when the SO is a clipping child (PSD clipping).
+    - Optional fabric shading / fold occlusion.
     """
     overrides = overrides or {}
     original_linked = original_linked or {}
@@ -340,12 +402,38 @@ def composite_document(
             getattr(layer, "clipping", 0),
         )
 
-        def _warp(src: Image.Image) -> Image.Image:
-            # Mesh warp intentionally ignored — the PlLd four corners already
-            # carry the tilt / perspective of the smart object placement.
+        local_size = (float(img.width), float(img.height))
+        has_mesh = transform.has_mesh_warp
+
+        def _warp(src: Image.Image, loc_size=None) -> Image.Image:
+            ls = loc_size or (float(src.width), float(src.height))
+            if has_mesh:
+                mesh = transform.document_mesh(canvas_size, local_size=ls)
+                if mesh and len(mesh) == 16:
+                    return warp_to_mesh(src, mesh, canvas_size)
             return warp_to_quad(src, transform.corners, canvas_size)
 
-        warped = _warp(img)
+        log.info(
+            "Warping %r with %s",
+            name,
+            "mesh" if has_mesh else "perspective-quad",
+        )
+        warped = _warp(img, local_size)
+
+        # Clip silhouette to the 4 PlLd corners (the intended print footprint).
+        # Mesh still warps the interior for fabric shape; corners define the edge.
+        try:
+            outline = list(transform.corners)
+            poly_mask = Image.new("L", canvas_size, 0)
+            ImageDraw.Draw(poly_mask).polygon(
+                [(float(x), float(y)) for x, y in outline], fill=255
+            )
+            poly_mask = poly_mask.filter(ImageFilter.GaussianBlur(radius=0.5))
+            poly_mask = poly_mask.point(lambda v: 255 if v > 128 else 0)
+            a = warped.split()[3]
+            warped.putalpha(ImageChops.multiply(a, poly_mask))
+        except Exception as exc:
+            log.debug("Outline clip failed for %r: %s", name, exc)
 
         # --- 1. Punch a hole: remove the old design from the base ---
         orig_data = original_linked.get(name)
@@ -356,7 +444,9 @@ def composite_document(
                 if orig_img is not None:
                     if orig_img.mode != "RGBA":
                         orig_img = orig_img.convert("RGBA")
-                    orig_warped = _warp(orig_img)
+                    orig_warped = _warp(
+                        orig_img, (float(orig_img.width), float(orig_img.height))
+                    )
                     _, _, _, oa = orig_warped.split()
                     oa = oa.filter(ImageFilter.GaussianBlur(radius=1.2))
                     if original_composite is not None:
@@ -399,7 +489,7 @@ def composite_document(
                     base_layer.display_name,
                 )
 
-        # --- 4. Fabric shading + fold occlusion (dark folds hide design) ---
+        # --- 4. Fabric shading + fold occlusion ---
         if fabric_strength > 0 and original_composite is not None:
             warped = _apply_fabric_shading(
                 warped, original_composite, fabric_strength
