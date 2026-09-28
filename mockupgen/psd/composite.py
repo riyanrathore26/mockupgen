@@ -46,12 +46,17 @@ def decode_image_data(doc: PSDDocument) -> Image.Image:
     return img
 
 
-def _decode_rle_planes(data: bytes, w: int, h: int, channels: int) -> list[bytes]:
+def _decode_rle_planes(
+    data: bytes, w: int, h: int, channels: int, *, psb: bool = False
+) -> list[bytes]:
+    """Decode planar RLE. PSD uses u16 row lengths; PSB uses u32."""
     n = channels * h
-    if len(data) < n * 2:
+    entry = 4 if psb else 2
+    if len(data) < n * entry:
         raise ValueError("RLE row-length table truncated")
-    lengths = struct.unpack(">" + "H" * n, data[: n * 2])
-    pos = n * 2
+    fmt = ">" + ("I" if psb else "H") * n
+    lengths = struct.unpack(fmt, data[: n * entry])
+    pos = n * entry
     rows: list[bytes] = []
     for length in lengths:
         chunk = data[pos : pos + length]
@@ -204,7 +209,7 @@ def linked_file_to_image(file_data: bytes) -> Optional[Image.Image]:
         try:
             return _decode_embedded_psd_image(file_data)
         except Exception as exc:
-            log.warning("Could not decode embedded PSD/PSB: %s", exc)
+            log.warning("Could not decode embedded PSD/PSB: %s", exp)
             return None
     return None
 
@@ -235,11 +240,12 @@ def _decode_embedded_psd_image(data: bytes) -> Image.Image:
     compression = struct.unpack(">H", data[pos : pos + 2])[0]
     pos += 2
     raw = data[pos:]
+    is_psb = version == 2
     if compression == 0:
         plane_size = width * height
         planes = [raw[i * plane_size : (i + 1) * plane_size] for i in range(min(channels, 4))]
     elif compression == 1:
-        planes = _decode_rle_planes(raw, width, height, channels)
+        planes = _decode_rle_planes(raw, width, height, channels, psb=is_psb)
     else:
         raise NotImplementedError(f"embedded compression {compression}")
     if channels >= 3:
@@ -258,7 +264,6 @@ def _apply_fabric_shading(
     original_composite: Image.Image,
     strength: float = 0.45,
 ) -> Image.Image:
-    """Multiply design by shirt high-pass so folds darken/brighten the print."""
     if strength <= 0:
         return warped
     w, h = warped.size
@@ -303,50 +308,29 @@ def _render_layer_alpha(
     lw, lh = layer.width, layer.height
     if lw == 0 or lh == 0:
         return None
-
     lam = (
         getattr(doc, "layer_and_mask", None)
         or getattr(doc, "layer_mask", None)
         or getattr(doc, "layer_info", None)
     )
     if lam is None:
-        log.warning("Document has no layer_and_mask; cannot read channel bytes")
         return None
-
     chan = lam.layer_channel_bytes(layer)
     if -1 not in chan:
-        log.warning(
-            "Layer %r has no transparency channel — using rect mask",
-            layer.display_name,
-        )
         mask = Image.new("L", (w, h), 0)
         ImageDraw.Draw(mask).rectangle(
             (layer.left, layer.top, layer.right, layer.bottom), fill=255
         )
         return mask
-
     body, compression = chan[-1]
     if compression == 0:
         raw = body[: lw * lh]
     elif compression == 1:
         raw = _decode_rle_channel(body, lw, lh)
     else:
-        log.warning(
-            "Unsupported compression %d for alpha of %r",
-            compression,
-            layer.display_name,
-        )
         return None
-
     if len(raw) < lw * lh:
-        log.warning(
-            "Alpha data short for %r: %d < %d",
-            layer.display_name,
-            len(raw),
-            lw * lh,
-        )
         return None
-
     tile = Image.frombytes("L", (lw, lh), raw[: lw * lh])
     mask = Image.new("L", (w, h), 0)
     mask.paste(tile, (layer.left, layer.top))
@@ -361,7 +345,6 @@ def composite_document(
     fabric_strength: float = 0.45,
     original_linked: Optional[dict[str, bytes]] = None,
 ) -> Image.Image:
-    """Build an exported RGB image of the document."""
     overrides = overrides or {}
     original_linked = original_linked or {}
     base_rgb = decode_image_data(doc)
@@ -382,7 +365,6 @@ def composite_document(
 
         transform = get_placed_transform(layer)
         if transform is None:
-            log.debug("No PlLd for layer %r — skip", name)
             continue
 
         log.info(
@@ -410,22 +392,20 @@ def composite_document(
         )
         warped = _warp(img, local_size)
 
-        # Soft clip to PlLd corners: keeps design on the print footprint
-        # without a hard sticker edge. Mesh already shaped the interior.
+        # Soft clip to PlLd corners so mesh overshoot cannot spill under the arm
         try:
             outline = list(transform.corners)
             poly_mask = Image.new("L", canvas_size, 0)
             ImageDraw.Draw(poly_mask).polygon(
                 [(float(x), float(y)) for x, y in outline], fill=255
             )
-            # Feather edge ~3px so it blends into fabric instead of a hard cut
-            poly_mask = poly_mask.filter(ImageFilter.GaussianBlur(radius=2.0))
+            poly_mask = poly_mask.filter(ImageFilter.GaussianBlur(radius=1.5))
             a = warped.split()[3]
             warped.putalpha(ImageChops.multiply(a, poly_mask))
         except Exception as exc:
             log.debug("Outline clip failed for %r: %s", name, exc)
 
-        # --- 1. Punch hole for old design ---
+        # --- 1. Punch hole (skip empty placeholder SOs) ---
         orig_data = original_linked.get(name)
         orig_warped = None
         if orig_data is not None:
@@ -434,29 +414,39 @@ def composite_document(
                 if orig_img is not None:
                     if orig_img.mode != "RGBA":
                         orig_img = orig_img.convert("RGBA")
-                    orig_warped = _warp(
-                        orig_img, (float(orig_img.width), float(orig_img.height))
-                    )
-                    _, _, _, oa = orig_warped.split()
-                    oa = oa.filter(ImageFilter.GaussianBlur(radius=1.2))
-                    if original_composite is not None:
-                        shirt = original_composite.convert("RGBA")
-                        shirt_blur = shirt.filter(ImageFilter.GaussianBlur(radius=8))
-                        result = Image.composite(shirt_blur, result, oa)
-                    log.debug("Punched hole for original design of %r", name)
+                    oa_check = orig_img.split()[3]
+                    if oa_check.getextrema()[1] <= 8:
+                        log.debug("Original SO for %r empty — skip punch-hole", name)
+                        orig_warped = None
+                    else:
+                        orig_warped = _warp(
+                            orig_img, (float(orig_img.width), float(orig_img.height))
+                        )
+                        _, _, _, oa = orig_warped.split()
+                        oa = oa.filter(ImageFilter.GaussianBlur(radius=1.2))
+                        if original_composite is not None:
+                            shirt = original_composite.convert("RGBA")
+                            shirt_blur = shirt.filter(ImageFilter.GaussianBlur(radius=8))
+                            result = Image.composite(shirt_blur, result, oa)
+                        log.debug("Punched hole for original design of %r", name)
             except Exception as exc:
                 log.debug("Could not punch hole for %r: %s", name, exc)
                 orig_warped = None
 
-        # --- 2. Original SO alpha ---
+        # --- 2. Original SO alpha only if SO has real coverage ---
         if orig_warped is not None:
             try:
-                _, _, _, new_a = warped.split()
                 _, _, _, orig_a = orig_warped.split()
-                orig_a = orig_a.filter(ImageFilter.GaussianBlur(radius=0.6))
-                combined_a = ImageChops.multiply(new_a, orig_a)
-                warped.putalpha(combined_a)
-                log.debug("Applied original SO alpha mask for %r", name)
+                if orig_a.getextrema()[1] > 8:
+                    _, _, _, new_a = warped.split()
+                    orig_a = orig_a.filter(ImageFilter.GaussianBlur(radius=0.6))
+                    warped.putalpha(ImageChops.multiply(new_a, orig_a))
+                    log.debug("Applied original SO alpha mask for %r", name)
+                else:
+                    log.debug(
+                        "Original SO for %r is empty/transparent — skip alpha mask",
+                        name,
+                    )
             except Exception as exc:
                 log.debug("Could not apply original mask for %r: %s", name, exc)
 
@@ -466,24 +456,12 @@ def composite_document(
             base_alpha = _render_layer_alpha(doc, base_layer, canvas_size)
             if base_alpha is not None:
                 a = warped.split()[3]
-                a = ImageChops.multiply(a, base_alpha)
-                warped.putalpha(a)
-                log.info(
-                    "Clipped %r to base layer %r",
-                    name,
-                    base_layer.display_name,
-                )
-            else:
-                log.warning(
-                    "Could not build clip mask for %r — smart object left unclipped",
-                    base_layer.display_name,
-                )
+                warped.putalpha(ImageChops.multiply(a, base_alpha))
+                log.info("Clipped %r to base layer %r", name, base_layer.display_name)
 
         # --- 4. Fabric shading + fold occlusion ---
         if fabric_strength > 0 and original_composite is not None:
-            warped = _apply_fabric_shading(
-                warped, original_composite, fabric_strength
-            )
+            warped = _apply_fabric_shading(warped, original_composite, fabric_strength)
             try:
                 w, h = warped.size
                 gray = original_composite.convert("L").resize((w, h), Image.Resampling.BILINEAR)
@@ -491,7 +469,6 @@ def composite_document(
                 detail = ImageChops.subtract(gray, blur, scale=1.0, offset=128)
 
                 def fold_alpha(d: int) -> int:
-                    # Dark folds hide the print (matches Photopea fabric occlusion)
                     if d >= 140:
                         return 255
                     if d <= 90:
@@ -500,8 +477,7 @@ def composite_document(
 
                 fold_mod = detail.point(fold_alpha)
                 _, _, _, a = warped.split()
-                a = ImageChops.multiply(a, fold_mod)
-                warped.putalpha(a)
+                warped.putalpha(ImageChops.multiply(a, fold_mod))
             except Exception as exc:
                 log.debug("Fold occlusion failed for %r: %s", name, exc)
 
